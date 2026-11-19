@@ -11,7 +11,8 @@ __pycache__/
 venv/
 env/
 
-# IDE and OS artifacts
+# IDE, local version state, and OS artifacts
+.vineproject_version.json
 .vscode/
 .idea/
 .DS_Store

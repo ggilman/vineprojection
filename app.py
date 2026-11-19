@@ -1,6 +1,8 @@
+# Copyright (c) 2026 George Gilman
+# SPDX-License-Identifier: MIT
 """
 Amazon Vine Rolling Tax & Decay Projection Analyzer
-===================================================
+---------------------------------------------------
 A lightweight Streamlit GUI application that dynamically parses Amazon Vine
 Itemized Tax Reports (.xlsx), computes rolling window tax totals, and projects
 when the trailing tax total will decay below a user-defined threshold.
@@ -840,6 +842,8 @@ def main() -> None:
             threading.Timer(0.4, lambda: os._exit(0)).start()
             st.stop()
 
+        st.caption("© 2026 George Gilman · [MIT License](https://github.com/ggilman/vineprojection/blob/main/LICENSE)")
+
     # -----------------------------------------------------------------------
     # Determine Active File Input
     # -----------------------------------------------------------------------
@@ -1132,6 +1136,13 @@ def main() -> None:
             width="stretch",
             hide_index=True,
         )
+
+    st.divider()
+    st.caption(
+        "Amazon Vine Rolling Tax & Decay Projection Analyzer · "
+        "Copyright © 2026 George Gilman · "
+        "[MIT License](https://github.com/ggilman/vineprojection/blob/main/LICENSE)"
+    )
 
 
 if __name__ == "__main__":

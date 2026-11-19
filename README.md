@@ -4,79 +4,73 @@ A lightweight, user-friendly GUI application that analyzes **Amazon Vine Itemize
 
 ---
 
-## Prerequisites
+## Quick Install & Launch (No Git Required)
 
-- **Python 3.9 or newer** installed on your system ([python.org/downloads](https://www.python.org/downloads/)).
+You do **not** need `git` or prior Python setup. Choose the method below for your operating system.
 
----
+### Option A: One-Line Terminal Installer (Recommended)
 
-## Installation & Running the App
+The installer will display what it plans to set up and **ask for your confirmation** before installing Python (if missing), downloading the application to your home folder (`~/VineProjection`), creating a **Desktop shortcut**, and installing the required Python libraries (`streamlit`, `pandas`, `openpyxl`, `plotly`). It **never modifies your system `PATH`**.
 
-### Option 1: One-Step Launch (Recommended)
-
-The project includes a cross-platform wrapper pair (`vineproject` and `vineproject.cmd`) that automatically verifies your Python environment, installs any missing dependencies (`streamlit`, `pandas`, `openpyxl`, `plotly`), and opens the app in your default web browser:
-
-- **Windows Command Prompt (`cmd.exe`):**
-  ```cmd
-  vineproject
-  ```
-  *(Or double-click `vineproject.cmd` directly in File Explorer.)*
-
-- **Windows PowerShell:**
-  ```powershell
-  .\vineproject
-  ```
-
-- **Linux / macOS / Git Bash:**
-  ```bash
-  chmod +x vineproject   # run once if needed
-  ./vineproject
-  ```
-
-*(Tip: If you add this project directory to your system `PATH`, you can simply run `vineproject` from any terminal.)*
-
-#### Launcher Flags
-All command-line flags are forwarded to `install_deps.py`:
-```powershell
-.\vineproject --check-only   # Verify and install dependencies without launching the UI
-.\vineproject --upgrade      # Upgrade all required packages to their latest versions
-.\vineproject --user         # Install packages into the user site-packages directory
-```
-
----
-
-### Option 2: Manual Installation & Launch
-
-If you prefer to manage your virtual environment or run `pip` and `streamlit` directly:
-
-1. **(Optional) Create and activate a virtual environment:**
-   - **Windows (PowerShell):**
+- **Windows (PowerShell):**
+  1. Press **`Win + X`** and click **Terminal** or **PowerShell**.
+  2. Paste the following command and press **Enter**:
      ```powershell
-     python -m venv .venv
-     .\.venv\Scripts\Activate.ps1
+     irm https://raw.githubusercontent.com/ggilman/vineprojection/main/vineproject.cmd | iex
      ```
-   - **Linux / macOS:**
+
+- **macOS / Linux (Terminal):**
+  1. Open **Terminal**.
+  2. Paste the following command and press **Enter**:
      ```bash
-     python3 -m venv .venv
-     source .venv/bin/activate
+     curl -fsSL https://raw.githubusercontent.com/ggilman/vineprojection/main/vineproject | bash
      ```
 
-2. **Install dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Or explicitly: `pip install streamlit pandas openpyxl plotly`)*
+---
 
-   Alternatively, run the dependency installer script directly:
-   ```bash
-   python install_deps.py --check-only
+### Option B: Browser ZIP Download (No Terminal Required on Windows)
+
+1. [**Click here to download the latest ZIP from GitHub**](https://github.com/ggilman/vineprojection/archive/refs/heads/main.zip).
+2. Extract (`Unzip`) the downloaded folder anywhere on your computer.
+3. Double-click **`vineproject.cmd`** (on Windows) or **`vineproject`** (on macOS/Linux).
+   - On first run, it will ask for your confirmation before installing Python (if needed), creating a **Desktop shortcut** (`Amazon Vine Tax Analyzer`), installing required Python packages, and opening the app in your web browser.
+
+---
+
+## Daily Usage & Automatic Updates
+
+Once installed:
+
+1. **Launch from your Desktop:**
+   - Double-click the **`Amazon Vine Tax Analyzer`** shortcut on your Desktop, **or**
+   - Run `.\vineproject` (Windows PowerShell), `vineproject` (Windows Command Prompt), or `./vineproject` (macOS/Linux/Git Bash) inside the project folder.
+
+2. **Automatic GitHub Update Check on Startup:**
+   - Each time you start the app, `vineproject` automatically checks [`github.com/ggilman/vineprojection`](https://github.com/ggilman/vineprojection) to see if a newer version is available.
+   - If an update is found, it displays the commit summary and changed files and asks:
+     `Download and install this update from GitHub now? [Y/n]`
+   - Updating preserves all of your `.xlsx` tax report files in the folder and does not require `git`.
+
+3. **Command-Line Flags:**
+   All flags passed to `vineproject` / `vineproject.cmd` are forwarded to `install_deps.py`:
+   ```powershell
+   .\vineproject --check-only   # Check updates and verify/install dependencies without launching the UI
+   .\vineproject --no-update    # Skip the GitHub update check on startup
+   .\vineproject --upgrade      # Upgrade all required Python packages to their latest versions
+   .\vineproject --user         # Install Python packages into the user site-packages directory
+   .\vineproject --yes          # Automatically answer "Yes" to update and package confirmation prompts
    ```
 
-3. **Run the application:**
-   ```bash
-   streamlit run app.py
-   ```
-   *(Or run `python install_deps.py --run`)*
+---
+
+## Manual Developer Setup (Optional)
+
+If you prefer to manage your own Python 3.9+ virtual environment and run `pip` / `streamlit` directly:
+
+```bash
+pip install streamlit pandas openpyxl plotly
+streamlit run app.py
+```
 
 ---
 
@@ -130,8 +124,17 @@ Once the application opens in your browser (`http://localhost:8501`):
 
 | File | Purpose |
 | :--- | :--- |
-| `vineproject` | Extensionless Bash launcher for Linux, macOS, and Git Bash |
-| `vineproject.cmd` | Windows launcher for Command Prompt, PowerShell, and File Explorer |
-| `install_deps.py` | Dependency checker, auto-installer, and clean Streamlit process manager |
+| `vineproject.cmd` | Combined Windows one-line web installer, standalone bootstrapper, and daily launcher |
+| `vineproject` | Combined macOS / Linux / Git Bash one-line web installer and daily launcher |
+| `install_deps.py` | Startup GitHub auto-updater, dependency installer (with confirmation), and Streamlit launcher |
 | `app.py` | Streamlit GUI application, Excel parser, decay calculation engine, and Plotly charts |
 | `requirements.txt` | Python package requirements (`streamlit`, `pandas`, `openpyxl`, `plotly`) |
+| `LICENSE` | MIT License (`Copyright (c) 2026 George Gilman`) |
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see the [LICENSE](LICENSE) file for details.
+
+Copyright (c) 2026 George Gilman
