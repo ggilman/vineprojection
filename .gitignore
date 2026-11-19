@@ -11,8 +11,14 @@ __pycache__/
 venv/
 env/
 
+# Auto-downloaded Amazon Vine reports & debug snapshots (Live feature)
+vine_reports/
+# Locally saved Amazon page snapshots (contain account tokens — never commit)
+Downloadpage.html
+
 # IDE, local version state, and OS artifacts
 .vineproject_version.json
+.vineproject_chromium.json
 .vscode/
 .idea/
 .DS_Store

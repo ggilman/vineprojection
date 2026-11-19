@@ -8,8 +8,10 @@ for Vine ETV Analyzer.
 By default, running this script will:
   1. Check GitHub (https://github.com/ggilman/vineprojection) for updates and
      prompt for confirmation before downloading/applying any update.
-  2. Check if required Python packages (streamlit, pandas, openpyxl, plotly) are installed,
-     and prompt for confirmation before installing any missing or outdated packages.
+  2. Check if required Python packages (streamlit, pandas, openpyxl, plotly, playwright) are
+     installed, prompt for confirmation before installing any missing or outdated packages,
+     and offer a one-time (remembered) Chromium download for the optional Amazon Vine Live
+     feature. Use --install-browser to (re)attempt that download.
   3. Launch the Streamlit GUI application (app.py) in your default web browser.
 
 Usage:
@@ -55,6 +57,9 @@ GITHUB_ZIP_URL = (
     f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/archive/refs/heads/{GITHUB_BRANCH}.zip"
 )
 VERSION_STATE_FILE = ".vineproject_version.json"
+CHROMIUM_STATE_FILE = ".vineproject_chromium.json"
+
+PLAYWRIGHT_CDN_HOST = "cdn.playwright.dev"
 
 # Application files tracked and updated during self-update
 MANAGED_APP_FILES: tuple[str, ...] = (
@@ -62,6 +67,7 @@ MANAGED_APP_FILES: tuple[str, ...] = (
     "install_deps.py",
     "requirements.txt",
     "README.md",
+    "PRIVACY.md",
     "LICENSE",
     "vineproject",
     "vineproject.cmd",
@@ -77,6 +83,7 @@ DEFAULT_REQUIREMENTS: list[str] = [
     "pandas>=2.0.0",
     "openpyxl>=3.1.0",
     "plotly>=5.18.0",
+    "playwright>=1.40.0",
 ]
 
 REQ_PATTERN = re.compile(r"^([A-Za-z0-9_.\-]+)\s*(?:([><=!~]+)\s*([0-9A-Za-z_.\-]+))?")
@@ -495,6 +502,256 @@ def install_packages(specs: list[str], upgrade: bool = False, user: bool = False
     return False
 
 
+def _browsers_root() -> Path:
+    home = Path.home()
+    if os.name == "nt":
+        base = Path(os.getenv("LOCALAPPDATA", str(home / "AppData" / "Local")))
+    elif sys.platform == "darwin":
+        base = home / "Library" / "Caches"
+    else:
+        base = Path(os.getenv("XDG_CACHE_HOME", str(home / ".cache")))
+    return base / "ms-playwright"
+
+
+def _chromium_present() -> bool:
+    root = _browsers_root()
+    if not root.is_dir():
+        return False
+    try:
+        return any(child.name.startswith("chromium") for child in root.iterdir())
+    except OSError:
+        return False
+
+
+def _read_json_state(path: Path) -> dict[str, Any]:
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def _write_json_state(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _download_chromium(extra_env: dict[str, str] | None = None) -> tuple[bool, str]:
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1800,
+            env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Download timed out."
+    output = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()
+    return result.returncode == 0, output
+
+
+def _is_certificate_error(output: str) -> bool:
+    lowered = output.lower()
+    return "self-signed certificate" in lowered or "unable to get local issuer" in lowered
+
+
+def _parse_proxy_hostport() -> tuple[str, int] | None:
+    proxy = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy") or ""
+    raw = proxy.split("://", 1)[-1].split("@", 1)[-1].split("/", 1)[0].strip()
+    if not raw:
+        return None
+    host, colon, port = raw.rpartition(":")
+    if colon and port.isdigit():
+        return host, int(port)
+    return host or raw, 80
+
+
+def _export_proxy_ca_bundle() -> Path | None:
+    """
+    Some corporate/agency TLS proxies intercept HTTPS using an internal CA trusted by
+    the Windows certificate store but unknown to Node.js (which powers the Playwright
+    browser downloader). Export the chain Windows already trusts for the Playwright
+    CDN into a PEM bundle so the Node download can verify it.
+    """
+    if os.name != "nt":
+        return None
+    proxy = _parse_proxy_hostport()
+    proxy_host, proxy_port = proxy if proxy else ("", 80)
+    bundle_path = Path(tempfile.gettempdir()) / "vineprojection_corp_ca.pem"
+    script_path = Path(tempfile.gettempdir()) / "vineprojection_corp_ca.ps1"
+    if bundle_path.is_file():
+        try:
+            bundle_path.unlink()
+        except OSError:
+            pass
+    try:
+        script_path.write_text(CORP_CA_EXPORT_PS, encoding="utf-8")
+        result = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script_path),
+                "-TargetHost",
+                PLAYWRIGHT_CDN_HOST,
+                "-ProxyHost",
+                proxy_host,
+                "-ProxyPort",
+                str(proxy_port),
+                "-OutPath",
+                str(bundle_path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or not bundle_path.is_file():
+        return None
+    return bundle_path
+
+
+CORP_CA_EXPORT_PS = r"""
+param([string]$TargetHost, [string]$ProxyHost, [int]$ProxyPort, [string]$OutPath)
+try {
+  $tcp = New-Object System.Net.Sockets.TcpClient
+  if ($ProxyHost) {
+    $tcp.Connect($ProxyHost, $ProxyPort)
+    $net = $tcp.GetStream()
+    $req = "CONNECT ${TargetHost}:443 HTTP/1.1`r`n"
+    $req += "Host: ${TargetHost}:443`r`n`r`n"
+    $bytes = [Text.Encoding]::ASCII.GetBytes($req)
+    $net.Write($bytes, 0, $bytes.Length)
+    $net.Flush()
+    $reader = New-Object System.IO.StreamReader($net)
+    $status = $reader.ReadLine()
+    while ($true) {
+      $line = $reader.ReadLine()
+      if ($null -eq $line -or $line -eq '') { break }
+    }
+    if ($status -notmatch '200') { Write-Output "ERR tunnel: $status"; exit 1 }
+  } else {
+    $tcp.Connect($TargetHost, 443)
+    $net = $tcp.GetStream()
+  }
+  $callback = [System.Net.Security.RemoteCertificateValidationCallback] {
+    param($s, $cert, $chain, $errors) $true
+  }
+  $ssl = New-Object System.Net.Security.SslStream($net, $false, $callback)
+  $ssl.AuthenticateAsClient($TargetHost)
+  $leaf = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+  $ssl.Close()
+  $tcp.Close()
+  $chainObj = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+  $chainObj.ChainPolicy.RevocationMode = 'NoCheck'
+  [void]$chainObj.Build($leaf)
+  $pem = @()
+  foreach ($el in $chainObj.ChainElements) {
+    $b64 = [Convert]::ToBase64String($el.Certificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
+    $pem += ('-----BEGIN CERTIFICATE-----' + [Environment]::NewLine + $b64 + [Environment]::NewLine + '-----END CERTIFICATE-----')
+  }
+  Set-Content -Path $OutPath -Value ($pem -join [Environment]::NewLine) -Encoding ascii
+  Write-Output "BUNDLE chainlen:$($chainObj.ChainElements.Count)"
+} catch {
+  Write-Output "ERR:$_"
+  exit 1
+}
+"""
+
+
+def ensure_playwright_browsers(
+    script_dir: Path, auto_yes: bool = False, force: bool = False
+) -> bool:
+    """
+    If the optional Amazon Vine Live feature is available (playwright package installed),
+    make sure the bundled Chromium browser has been downloaded exactly once. The outcome
+    (installed / declined / failed) is remembered in CHROMIUM_STATE_FILE so the user is
+    never nagged again; --install-browser forces a retry.
+    """
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("playwright") is None:
+            return True
+    except (ImportError, ValueError):
+        return True
+
+    if _chromium_present():
+        return True
+
+    state_path = script_dir / CHROMIUM_STATE_FILE
+    status = str(_read_json_state(state_path).get("status", ""))
+    if not force and status == "declined":
+        print(
+            "[INFO] Bundled Chromium download was skipped earlier. "
+            "Retry with: vineproject --install-browser"
+        )
+        return True
+    if not force and status == "failed":
+        print(
+            "[INFO] Bundled Chromium download previously failed; not retrying automatically. "
+            "The live Vine connection still works via installed Chrome/Edge. "
+            "Retry with: vineproject --install-browser"
+        )
+        return True
+
+    print(
+        "\n[NOTICE] The optional 'Amazon Vine Live' feature works best with the bundled "
+        "Chromium browser (~150 MB, downloaded once). If skipped, your installed "
+        "Chrome/Edge will be used instead."
+    )
+    if not force and not prompt_confirm(
+        "Download the Chromium browser for the live Vine connection now?",
+        auto_yes=auto_yes,
+        default=True,
+    ):
+        _write_json_state(state_path, {"status": "declined"})
+        print(
+            "[INFO] Skipped. The live Vine connection will use an installed Chrome/Edge "
+            "when possible. You can enable this later with: vineproject --install-browser"
+        )
+        return True
+
+    print("[INSTALL] Downloading Playwright Chromium browser (this may take a few minutes)...")
+    ok, output = _download_chromium()
+    if not ok and _is_certificate_error(output):
+        print(
+            "[INFO] TLS-intercepting proxy detected; retrying with the CA chain your "
+            "Windows certificate store already trusts..."
+        )
+        bundle = _export_proxy_ca_bundle()
+        if bundle is not None:
+            ok, output = _download_chromium(extra_env={"NODE_EXTRA_CA_CERTS": str(bundle)})
+
+    if ok:
+        _write_json_state(state_path, {"status": "installed"})
+        print("[SUCCESS] Chromium browser is now available for the live Vine connection!")
+        return True
+
+    detail = next((ln.strip() for ln in reversed(output.splitlines()) if ln.strip()), "unknown error")
+    _write_json_state(state_path, {"status": "failed", "detail": detail[:200]})
+    print(f"[WARN] Chromium download failed ({detail[:200]}).")
+    print(
+        "[INFO] The live Vine connection can still use your installed Chrome/Edge. "
+        "Retry the download later with: vineproject --install-browser"
+    )
+    return False
+
+
 def main(default_run: bool = True) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -538,6 +795,12 @@ def main(default_run: bool = True) -> int:
         dest="auto_yes",
         action="store_true",
         help="Automatically confirm update and package installation prompts.",
+    )
+    parser.add_argument(
+        "--install-browser",
+        dest="install_browser",
+        action="store_true",
+        help="(Re)attempt downloading the bundled Chromium browser for the live Vine feature.",
     )
     args = parser.parse_args()
 
@@ -606,6 +869,10 @@ def main(default_run: bool = True) -> int:
         print("\n[SUCCESS] All required packages are now installed and verified!")
     else:
         print("\n[SUCCESS] All required packages are already installed and up to date!")
+
+    ensure_playwright_browsers(
+        script_dir, auto_yes=args.auto_yes, force=args.install_browser
+    )
 
     should_run = args.run and not args.check_only
     if should_run:
