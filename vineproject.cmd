@@ -78,11 +78,11 @@ if ($LocalDir -and (Test-Path (Join-Path $LocalDir 'install_deps.py')) -and $PyI
 
 $InstallDir = if ($LocalDir -and (Test-Path (Join-Path $LocalDir 'app.py'))) { $LocalDir } else { Join-Path $HOME 'VineProjection' }
 $DesktopDir = [Environment]::GetFolderPath('Desktop')
-$ShortcutPath = Join-Path $DesktopDir 'Amazon Vine Tax Analyzer.lnk'
+$ShortcutPath = Join-Path $DesktopDir 'Vine ETV Analyzer.lnk'
 
 Write-Host ""
 Write-Host "================================================================" -ForegroundColor Cyan
-Write-Host "  Amazon Vine Rolling Tax & Decay Analyzer - Setup Wizard" -ForegroundColor Cyan
+Write-Host "  Vine ETV Analyzer - Setup Wizard" -ForegroundColor Cyan
 Write-Host "  Copyright (c) 2026 George Gilman (MIT License)" -ForegroundColor DarkCyan
 Write-Host "================================================================" -ForegroundColor Cyan
 Write-Host "  Target Folder    : $InstallDir"
@@ -135,7 +135,7 @@ if (-not $PyInfo) {
 # 2. Download application files from GitHub if not already running inside a complete local folder
 if (-not (Test-Path (Join-Path $InstallDir 'app.py')) -or -not $LocalDir) {
     Write-Host ""
-    Write-Host "[DOWNLOAD] Downloading latest Amazon Vine Tax Analyzer from GitHub..." -ForegroundColor Cyan
+    Write-Host "[DOWNLOAD] Downloading latest Vine ETV Analyzer from GitHub..." -ForegroundColor Cyan
     $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("vineproj_setup_" + [Guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
     try {
@@ -164,8 +164,13 @@ try {
         $shortcut = $wsh.CreateShortcut($ShortcutPath)
         $shortcut.TargetPath = Join-Path $InstallDir "vineproject.cmd"
         $shortcut.WorkingDirectory = $InstallDir
-        $shortcut.Description = "Launch Amazon Vine Rolling Tax & Decay Analyzer"
-        $shortcut.IconLocation = "shell32.dll,21"
+        $shortcut.Description = "Launch Vine ETV Analyzer"
+        $iconPath = Join-Path $InstallDir "icon.ico"
+        if (Test-Path $iconPath) {
+            $shortcut.IconLocation = "$iconPath,0"
+        } else {
+            $shortcut.IconLocation = "shell32.dll,21"
+        }
         $shortcut.Save()
         Write-Host "[SUCCESS] Created Desktop shortcut: $ShortcutPath" -ForegroundColor Green
     }

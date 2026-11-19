@@ -1,11 +1,12 @@
 # Copyright (c) 2026 George Gilman
 # SPDX-License-Identifier: MIT
 """
-Amazon Vine Rolling Tax & Decay Projection Analyzer
----------------------------------------------------
+Vine ETV Analyzer
+-----------------
 A lightweight Streamlit GUI application that dynamically parses Amazon Vine
-Itemized Tax Reports (.xlsx), computes rolling window tax totals, and projects
-when the trailing tax total will decay below a user-defined threshold.
+Itemized Reports (.xlsx), tracks your floating window of Estimated Tax Value
+(ETV) against a rolling cap (e.g., $6,000 over 30 days), and projects when
+older orders roll off so you can acquire items again.
 
 Run instructions:
     pip install streamlit pandas openpyxl plotly
@@ -640,7 +641,7 @@ def build_decay_chart(
 
     fig.update_layout(
         title={
-            "text": f"Projected {window_days}-Day Rolling Tax Decay Curve",
+            "text": f"Projected {window_days}-Day Rolling ETV Decay Curve",
             "font": {"size": 18},
         },
         xaxis={
@@ -650,7 +651,7 @@ def build_decay_chart(
             "gridcolor": "rgba(148, 163, 184, 0.2)",
         },
         yaxis={
-            "title": "Rolling Tax Value ($)",
+            "title": "Rolling ETV ($)",
             "tickprefix": "$",
             "tickformat": ",.2f",
             "rangemode": "tozero",
@@ -724,9 +725,10 @@ def build_demo_excel_bytes() -> bytes:
 
 
 def main() -> None:
+    icon_file = Path(__file__).resolve().parent / "icon.png"
     st.set_page_config(
-        page_title="Amazon Vine Tax Decay Analyzer",
-        page_icon="📉",
+        page_title="Vine ETV Analyzer",
+        page_icon=str(icon_file) if icon_file.is_file() else "📉",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -747,10 +749,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("📉 Amazon Vine Rolling Tax & Decay Projection")
+    st.title("📉 Vine ETV Analyzer")
     st.caption(
-        "Analyze Amazon Vine Itemized Tax Reports (.xlsx) and track when your rolling "
-        "Estimated Tax Value (ETV) decays below your target threshold assuming no new orders."
+        "See your floating window of Amazon Vine items and project when older orders roll off "
+        "below the rolling cap (e.g., $6,000 over 30 days) so you can acquire items again."
     )
 
     # -----------------------------------------------------------------------
@@ -759,9 +761,9 @@ def main() -> None:
     with st.sidebar:
         st.header("1. Data Source")
         uploaded_file = st.file_uploader(
-            "Upload Amazon Vine Tax Report (.xlsx)",
+            "Upload Amazon Vine Itemized Report (.xlsx)",
             type=["xlsx"],
-            help="Select an Amazon Vine Itemized Tax Report Excel file (.xlsx).",
+            help="Select your Amazon Vine Itemized Report Excel file (.xlsx).",
         )
 
         # Also check if there are any .xlsx files in the local directory for convenience
@@ -862,8 +864,8 @@ def main() -> None:
 
     if file_source is None:
         st.info(
-            "👈 **Upload an Amazon Vine Itemized Tax Report (`.xlsx`)** in the sidebar "
-            "(or toggle **Load built-in sample report**) to begin analysis."
+            "👈 **Upload your Amazon Vine Itemized Report (`.xlsx`)** in the sidebar "
+            "(or toggle **Load built-in sample report**) to view your rolling ETV window and projection."
         )
         with st.expander("Expected Excel Columns & Format Details", expanded=True):
             st.markdown(
@@ -1139,7 +1141,7 @@ def main() -> None:
 
     st.divider()
     st.caption(
-        "Amazon Vine Rolling Tax & Decay Projection Analyzer · "
+        "Vine ETV Analyzer · "
         "Copyright © 2026 George Gilman · "
         "[MIT License](https://github.com/ggilman/vineprojection/blob/main/LICENSE)"
     )

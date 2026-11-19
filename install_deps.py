@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: MIT
 """
 One-Step Startup Auto-Updater, Dependency Checker, Installer & App Launcher
-for Amazon Vine Tax Decay Analyzer.
+for Vine ETV Analyzer.
 
 By default, running this script will:
   1. Check GitHub (https://github.com/ggilman/vineprojection) for updates and
@@ -65,6 +65,8 @@ MANAGED_APP_FILES: tuple[str, ...] = (
     "LICENSE",
     "vineproject",
     "vineproject.cmd",
+    "icon.png",
+    "icon.ico",
     ".gitignore",
     ".gitattributes",
 )
@@ -497,7 +499,7 @@ def main(default_run: bool = True) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Check for app updates, verify/install Python dependencies, "
-            "and launch the Amazon Vine Tax Decay Analyzer."
+            "and launch the Vine ETV Analyzer."
         )
     )
     parser.add_argument(
@@ -608,7 +610,7 @@ def main(default_run: bool = True) -> int:
     should_run = args.run and not args.check_only
     if should_run:
         app_path = script_dir / "app.py"
-        print(f"\n[LAUNCH] Starting Amazon Vine Tax Decay Analyzer ({app_path.name})...")
+        print(f"\n[LAUNCH] Starting Vine ETV Analyzer ({app_path.name})...")
         print(
             "[INFO] Your web browser will open automatically. "
             "Use the 'Quit Application' button in the sidebar (or press Ctrl+C here) to exit.\n"
@@ -631,7 +633,7 @@ def launch_streamlit(app_path: Path) -> int:
             except subprocess.TimeoutExpired:
                 continue
     except KeyboardInterrupt:
-        print("\n[INFO] Stopping Amazon Vine Tax Decay Analyzer...")
+        print("\n[INFO] Stopping Vine ETV Analyzer...")
         try:
             proc.wait(timeout=3.0)
         except subprocess.TimeoutExpired:

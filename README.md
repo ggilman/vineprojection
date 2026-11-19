@@ -1,6 +1,16 @@
-# Amazon Vine Itemized Tax Report & Rolling Decay Analyzer
+# Vine ETV Analyzer
 
-A lightweight, user-friendly GUI application that analyzes **Amazon Vine Itemized Tax Reports (`.xlsx`)** and visualizes when your rolling Estimated Tax Value (ETV) total will drop below a target dollar threshold assuming no new orders are placed.
+**Vine ETV Analyzer** is a lightweight, user-friendly desktop and browser utility for Amazon Vine members to visualize their **floating window of Estimated Tax Value (ETV)** and see exactly when older orders roll off so they can acquire items again.
+
+### Why This Utility Exists
+Amazon Vine enforces a rolling ETV cap—most commonly **$6,000.00 over a trailing 30-day floating window** (though both the dollar cap and window length are configurable). When your trailing 30-day ETV reaches or exceeds that cap, you are temporarily blocked from requesting additional Vine items until enough older orders age out of the rolling window to bring your total back below the threshold.
+
+While Amazon provides downloadable **Vine Itemized Reports (`.xlsx`)** for tax purposes, the spreadsheet only lists raw historical transactions—it does not show your current floating window total or when your rolling balance will drop back under the cap. **Vine ETV Analyzer** reads your itemized report directly and shows:
+- Your **exact current rolling ETV total** (e.g., trailing 30 days) and how far above or below the cap you are right now.
+- A **day-by-day decay curve and schedule** projecting how your rolling ETV drops each day as older orders fall out of the window (assuming no new orders are placed).
+- The **exact date and projected dollar total** when your rolling ETV crosses back below your threshold so you know when you can order again.
+
+> **Important Note on Unshipped Orders:** Amazon's downloadable Vine Itemized Report (`.xlsx`) only records items once they have shipped—it **does not include items you have ordered that have not yet shipped**. As a result, pending unshipped orders are not part of this analysis. Keep any unshipped orders in mind when comparing your projected total against your rolling cap.
 
 ---
 
@@ -33,7 +43,7 @@ The installer will display what it plans to set up and **ask for your confirmati
 1. [**Click here to download the latest ZIP from GitHub**](https://github.com/ggilman/vineprojection/archive/refs/heads/main.zip).
 2. Extract (`Unzip`) the downloaded folder anywhere on your computer.
 3. Double-click **`vineproject.cmd`** (on Windows) or **`vineproject`** (on macOS/Linux).
-   - On first run, it will ask for your confirmation before installing Python (if needed), creating a **Desktop shortcut** (`Amazon Vine Tax Analyzer`), installing required Python packages, and opening the app in your web browser.
+   - On first run, it will ask for your confirmation before installing Python (if needed), creating a **Desktop shortcut** (`Vine ETV Analyzer`), installing required Python packages, and opening the app in your web browser.
 
 ---
 
@@ -42,7 +52,7 @@ The installer will display what it plans to set up and **ask for your confirmati
 Once installed:
 
 1. **Launch from your Desktop:**
-   - Double-click the **`Amazon Vine Tax Analyzer`** shortcut on your Desktop, **or**
+   - Double-click the **`Vine ETV Analyzer`** shortcut on your Desktop, **or**
    - Run `.\vineproject` (Windows PowerShell), `vineproject` (Windows Command Prompt), or `./vineproject` (macOS/Linux/Git Bash) inside the project folder.
 
 2. **Automatic GitHub Update Check on Startup:**
@@ -128,6 +138,7 @@ Once the application opens in your browser (`http://localhost:8501`):
 | `vineproject` | Combined macOS / Linux / Git Bash one-line web installer and daily launcher |
 | `install_deps.py` | Startup GitHub auto-updater, dependency installer (with confirmation), and Streamlit launcher |
 | `app.py` | Streamlit GUI application, Excel parser, decay calculation engine, and Plotly charts |
+| `icon.png` / `icon.ico` | Custom application icon for browser tab, Windows `.lnk` shortcut, and macOS/Linux desktop launchers |
 | `requirements.txt` | Python package requirements (`streamlit`, `pandas`, `openpyxl`, `plotly`) |
 | `LICENSE` | MIT License (`Copyright (c) 2026 George Gilman`) |
 
