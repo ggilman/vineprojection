@@ -922,8 +922,23 @@ def main(default_run: bool = True) -> int:
     return 0
 
 
+def _skip_streamlit_email_prompt() -> None:
+    """Streamlit asks for an email on its first run until ~/.streamlit/credentials.toml
+    exists. Write it with an empty email, the same file Streamlit saves when you just
+    press Enter at the prompt. An existing file is left alone."""
+    credentials = Path.home() / ".streamlit" / "credentials.toml"
+    if credentials.exists():
+        return
+    try:
+        credentials.parent.mkdir(parents=True, exist_ok=True)
+        credentials.write_text('[general]\nemail = ""\n', encoding="utf-8")
+    except OSError:
+        pass  # Streamlit just asks as usual
+
+
 def launch_streamlit(app_path: Path) -> int:
     """Launch Streamlit and handle Ctrl+C / termination cleanly without stack traces."""
+    _skip_streamlit_email_prompt()
     cmd = [sys.executable, "-m", "streamlit", "run", str(app_path)]
     proc = subprocess.Popen(cmd)
 

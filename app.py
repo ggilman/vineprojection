@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,15 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+
+# Amazon's itemized reports are written without a default cell style; openpyxl
+# warns about it on every load and then uses its own, which is harmless here.
+warnings.filterwarnings(
+    "ignore",
+    message="Workbook contains no default style",
+    category=UserWarning,
+    module="openpyxl",
+)
 
 # ---------------------------------------------------------------------------
 # Constants & Canonical Column Mapping
@@ -276,6 +286,7 @@ def load_vine_excel(file_source: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
                 break
         if col_map is not None:
             break
+    excel_file.close()
 
     if raw_df is None or header_row_idx is None or col_map is None:
         raise ValueError(
