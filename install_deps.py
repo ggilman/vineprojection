@@ -242,6 +242,9 @@ def check_and_apply_updates(script_dir: Path, auto_yes: bool = False) -> bool:
     for confirmation, download the latest archive from GitHub, update application files
     in place (preserving user .xlsx files), and return True if an update was applied.
     """
+    if (script_dir / ".git").exists():
+        return _update_git_checkout(script_dir, auto_yes)
+
     print("[UPDATE] Checking GitHub for application updates...")
     commit_data = _fetch_json(GITHUB_COMMITS_API, timeout=3.5)
     if not commit_data or "sha" not in commit_data:
@@ -289,6 +292,56 @@ def check_and_apply_updates(script_dir: Path, auto_yes: bool = False) -> bool:
     return perform_self_update(script_dir, remote_sha, commit_date)
 
 
+def _git_output(script_dir: Path, *args: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=str(script_dir),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _update_git_checkout(script_dir: Path, auto_yes: bool = False) -> bool:
+    """
+    A git checkout is updated only by a fast-forward `git pull`, and only when it is
+    clean and on the release branch. It is never overwritten from the ZIP archive or
+    reset, so local commits, other branches and uncommitted work are left alone.
+    """
+    if not shutil.which("git"):
+        print("[INFO] This is a git checkout but git is not installed. Skipping update check.")
+        return False
+    branch = _git_output(script_dir, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch != GITHUB_BRANCH:
+        print(f"[INFO] Git checkout is on '{branch or 'unknown'}', not '{GITHUB_BRANCH}'. Skipping update.")
+        return False
+    status = _git_output(script_dir, "status", "--porcelain")
+    if status is None or status:
+        print("[INFO] Git checkout has uncommitted changes. Skipping update.")
+        return False
+    print("[UPDATE] Checking GitHub for application updates...")
+    if _git_output(script_dir, "fetch", "origin", GITHUB_BRANCH) is None:
+        print("[INFO] Could not reach GitHub. Skipping update check.")
+        return False
+    before = _git_output(script_dir, "rev-parse", "HEAD")
+    if before == _git_output(script_dir, "rev-parse", f"origin/{GITHUB_BRANCH}"):
+        print("[INFO] Application is up to date.")
+        return False
+    if not prompt_confirm("An update is available. Pull it with git now?", auto_yes=auto_yes, default=True):
+        print("[INFO] Skipping update. Launching current version...")
+        return False
+    print("[UPDATE] Pulling the latest version with git (fast-forward only)...")
+    if _git_output(script_dir, "pull", "--ff-only", "origin", GITHUB_BRANCH) is None:
+        print("[WARN] git pull failed (offline, or the branch has diverged). Continuing with current version...")
+        return False
+    return _git_output(script_dir, "rev-parse", "HEAD") != before
+
+
 def perform_self_update(script_dir: Path, remote_sha: str, commit_date: str = "") -> bool:
     """
     Download the latest repository ZIP from GitHub and update managed files in `script_dir`.
@@ -315,8 +368,10 @@ def perform_self_update(script_dir: Path, remote_sha: str, commit_date: str = ""
             source_root = subdirs[0] if subdirs else extract_dir
 
             updated_count = 0
+            # Only the app's own files are replaced; nothing else in the folder
+            # (reports, venvs, anything the user added) is touched or deleted.
             for item in source_root.iterdir():
-                if item.name == ".git" or item.name == VERSION_STATE_FILE:
+                if item.name not in MANAGED_APP_FILES:
                     continue
                 dest = script_dir / item.name
                 if item.is_file():
@@ -333,26 +388,6 @@ def perform_self_update(script_dir: Path, remote_sha: str, commit_date: str = ""
                         except OSError:
                             pass
                     updated_count += 1
-                elif item.is_dir():
-                    if dest.exists():
-                        shutil.rmtree(dest)
-                    shutil.copytree(item, dest)
-                    updated_count += 1
-
-            # Also fast-forward local .git metadata if git and a clean working tree exist
-            if (script_dir / ".git").is_dir() and shutil.which("git"):
-                subprocess.run(
-                    ["git", "fetch", "origin", GITHUB_BRANCH],
-                    cwd=str(script_dir),
-                    capture_output=True,
-                    check=False,
-                )
-                subprocess.run(
-                    ["git", "reset", "--hard", f"origin/{GITHUB_BRANCH}"],
-                    cwd=str(script_dir),
-                    capture_output=True,
-                    check=False,
-                )
 
             _write_local_commit_sha(script_dir, remote_sha, commit_date)
             print(

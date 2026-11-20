@@ -167,11 +167,13 @@ def _parse_currency(val: Any) -> float:
     if s.startswith("(") and s.endswith(")"):
         is_negative = True
         s = s[1:-1].strip()
-    if "-" in s:
-        is_negative = True
-        s = s.replace("-", "").strip()
 
     s = re.sub(r"[$€£,\s]", "", s)
+    # Only a leading or trailing minus ("-$45.00", "$-45.00", "45.00-") means negative;
+    # a hyphen anywhere else leaves the value unparseable (malformed row).
+    if s.startswith("-") or s.endswith("-"):
+        is_negative = True
+        s = s[1:] if s.startswith("-") else s[:-1]
     num = float(s)
     if not math.isfinite(num):
         raise ValueError(f"Non-finite currency string: {val!r}")
@@ -491,10 +493,13 @@ def compute_timeframe_summary(
     df: pd.DataFrame,
     base_date: pd.Timestamp,
     inclusive_start: bool = False,
+    year_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Build the Timeframe Summary Table for standard rolling periods:
     7 Days, 30 Days, 60 Days, 90 Days, and Full Year Total.
+    `year_df` (default: `df`) holds the rows the Full Year Total covers, so a
+    prior year's report loaded for the rolling window doesn't count toward it.
     """
     base_ts = pd.Timestamp(base_date).normalize()
     periods = [
@@ -535,6 +540,7 @@ def compute_timeframe_summary(
         )
 
     # Full Year / Cumulative Total across all valid rows in the report
+    df = df if year_df is None else year_df
     min_d = df["Order Date"].min().strftime("%Y-%m-%d")
     max_d = df["Order Date"].max().strftime("%Y-%m-%d")
     orders_mask_all = df["Estimated Tax Value"] > 0
@@ -725,7 +731,8 @@ SIGNED_IN_COOKIE_NAMES: frozenset[str] = frozenset({"at-main"})
 
 
 def _reports_dir() -> Path:
-    return Path.cwd() / VINE_REPORTS_DIRNAME
+    # Beside the app, not the launch directory, so reports are found however it's started.
+    return Path(__file__).resolve().parent / VINE_REPORTS_DIRNAME
 
 
 def _app_data_root() -> Path:
@@ -901,14 +908,11 @@ def _copy_browser_profile(profile: dict[str, Any]) -> None:
         default_dir = tmp / "Default"
         default_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(root / "Local State", tmp / "Local State")
-        cookies_rel = str(profile.get("cookies_rel") or "Cookies")
-        cookies_path = root / Path(cookies_rel)
-        dest_parent = default_dir / Path(cookies_rel).parent
-        dest_parent.mkdir(parents=True, exist_ok=True)
-        for suffix in ("", "-wal", "-shm"):
-            src = cookies_path.with_name(cookies_path.name + suffix)
-            if src.is_file():
-                shutil.copy2(src, dest_parent / (Path(cookies_rel).name + suffix))
+        cookies_rel = Path(str(profile.get("cookies_rel") or "Default/Cookies"))
+        # cookies_rel starts with the source profile's folder ("Default", "Profile 1");
+        # in the session that profile becomes "Default", so keep only the part inside it.
+        inside_profile = Path(*cookies_rel.parts[1:]) if len(cookies_rel.parts) > 1 else cookies_rel
+        _copy_cookie_trio(root / cookies_rel, (default_dir / inside_profile).parent)
         # Only discard the existing session once the fresh copy fully succeeded.
         if session.exists():
             shutil.rmtree(session, ignore_errors=True)
@@ -1005,18 +1009,10 @@ def _launch_vine_context(pw: Any, headless: bool = False) -> tuple[Any, str | No
     )
 
 
-def _extract_cap_sentence(html: str, needle: str) -> str:
-    plain = re.sub(r"<[^>]+>", " ", html)
-    plain = re.sub(r"\s+", " ", plain).strip()
-    idx = plain.casefold().find(needle.casefold())
-    if idx < 0:
-        return needle
-    start = max(0, idx - 90)
-    end = min(len(plain), idx + len(needle) + 160)
-    return plain[start:end].strip()
-
-
-def classify_vine_page(html: str, url: str) -> tuple[str, str]:
+def classify_vine_page(html: str, url: str, visible_text: str | None = None) -> tuple[str, str]:
+    """`visible_text` is the page's rendered text. The cap messages are matched only
+    there when given: Vine pages carry hidden alert templates with the same wording,
+    so matching the raw HTML would report CAPPED while claiming is open."""
     if any(marker in url for marker in LOGIN_WALL_URL_MARKERS) or "/ap/" in url:
         return CAP_NEEDS_LOGIN, url
     if any(marker in url for marker in CAPTCHA_URL_MARKERS):
@@ -1026,10 +1022,11 @@ def classify_vine_page(html: str, url: str) -> tuple[str, str]:
         match = re.search(pattern, lowered)
         if match:
             return CAP_BLOCKED, match.group(0)
+    cap_source = html if visible_text is None else visible_text
     for pattern in CAP_MESSAGE_PATTERNS:
-        match = re.search(pattern, html, re.IGNORECASE)
+        match = re.search(pattern, cap_source, re.IGNORECASE)
         if match:
-            return CAP_CAPPED, _extract_cap_sentence(html, match.group(0))
+            return CAP_CAPPED, match.group(0)
     if url.startswith(VINE_ITEMS_URL) or "amazon.com/vine" in url:
         return CAP_OPEN, ""
     return CAP_UNKNOWN, url
@@ -1044,6 +1041,23 @@ def _unique_report_path(filename: str) -> Path:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         dest = reports / f"{dest.stem}_{stamp}{dest.suffix}"
     return dest
+
+
+def _report_year(path: Path) -> int | None:
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def pick_auto_reports(reports: list[Path]) -> tuple[Path, Path | None]:
+    """From reports sorted newest first, return the newest report and the newest
+    one for the year before it (or None). The rolling window can reach back
+    across New Year, and Amazon issues one itemized report per tax year."""
+    primary = reports[0]
+    year = _report_year(primary)
+    if year is None:
+        return primary, None
+    prior = next((r for r in reports if _report_year(r) == year - 1), None)
+    return primary, prior
 
 
 def list_auto_reports() -> list[Path]:
@@ -1163,7 +1177,7 @@ def download_itemized_report(context: Any, page: Any) -> dict[str, Any]:
     year = date.today().year
     page.goto(VINE_ACCOUNT_URL, wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(2000)
-    status, _ = classify_vine_page(page.content(), page.url)
+    status, _ = classify_live_page(page)
     if status == CAP_NEEDS_LOGIN:
         raise ConnectionError("Amazon redirected the account page back to sign-in.")
 
@@ -1281,28 +1295,71 @@ def _session_has_cookies() -> bool:
     return (default_dir / "Network" / "Cookies").is_file() or (default_dir / "Cookies").is_file()
 
 
+@st.cache_resource(show_spinner=False)
+def _browser_lock() -> threading.Lock:
+    """One lock for the whole Streamlit server process. cache_resource survives
+    script reruns and is shared by every browser tab, so only one flow at a time
+    drives (or copies over) the shared vine-session profile. Without it, a second
+    tab's automatic check would hit the profile lock and kill the first tab's
+    open sign-in window via _kill_session_browser()."""
+    return threading.Lock()
+
+
+BROWSER_BUSY_MESSAGE = (
+    "Another Amazon Vine check or sign-in window is already running. "
+    "Finish or close it, then try again."
+)
+SIGN_IN_TIMEOUT_SECONDS = 900.0
+SIGN_IN_POLL_SECONDS = 1.5
+
+LIVE_STATUS_ERRORS: dict[str, str] = {
+    CAP_NEEDS_LOGIN: "Amazon does not recognize the saved session — sign-in required.",
+    CAP_BLOCKED: "Amazon presented a security/bot check — use 'Sign in' to retry interactively.",
+}
+
+
+def _new_live_result() -> dict[str, Any]:
+    return {
+        "connected": False,
+        "cap_status": None,
+        "report": None,
+        "report_error": None,
+        "error": None,
+        "channel": None,
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def _ensure_session_profile() -> str | None:
     """
-    Make sure a reusable browser session profile exists. Returns None when ready
-    (already present, silently copied from an installed Chrome/Edge profile, or an
-    existing partial session with cookies can be used), otherwise a human-readable
-    explanation of why silent reuse is unavailable.
+    Make sure a reusable browser session profile exists. Returns None when ready,
+    otherwise a human-readable explanation of why silent reuse is unavailable.
+
+    An existing session that holds an authenticated cookie is never overwritten:
+    it may be a fresh interactive sign-in whose connection marker was not written
+    yet (for example the user closed the window themselves).
     """
     if session_ready():
         return None
+    live_db = _cookies_db_path()
+    if _cookie_db_has_signed_in(live_db):
+        return None
     last_error = ""
     for profile in find_browser_profiles():
+        if profile.get("has_amazon") is False:
+            continue  # nothing worth copying from this profile
         try:
             _copy_browser_profile(profile)
             return None
         except OSError as exc:
             last_error = str(exc)
     if _session_has_cookies():
-        # Existing (for example previously signed-in) session survives.
+        # A partial session (e.g. from an unfinished sign-in) is still usable;
+        # the live check will report NEEDS_LOGIN if it is not signed in.
         return None
     if not last_error:
         return (
-            "No Chrome/Edge profile was found for silent session reuse. "
+            "No Chrome/Edge profile with Amazon cookies was found for silent session reuse. "
             "Use the sign-in option once to connect."
         )
     lowered = last_error.lower()
@@ -1315,10 +1372,24 @@ def _ensure_session_profile() -> str | None:
     return f"Could not copy the browser profile for silent reuse ({last_error})."
 
 
+def _visible_text(page: Any) -> str | None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        # innerText leaves out elements hidden with CSS (display:none, etc.).
+        return page.inner_text("body", timeout=10000)
+    except PlaywrightError:
+        return None
+
+
+def classify_live_page(page: Any) -> tuple[str, str]:
+    return classify_vine_page(page.content(), page.url, _visible_text(page))
+
+
 def _visit_and_classify_items(page: Any) -> tuple[str, str]:
     page.goto(VINE_ITEMS_URL, wait_until="domcontentloaded", timeout=45000)
     page.wait_for_timeout(2500)
-    status, detail = classify_vine_page(page.content(), page.url)
+    status, detail = classify_live_page(page)
     if status == CAP_NEEDS_LOGIN:
         # Amazon's silent SSO re-auth can briefly flash the /ap/signin URL
         # before landing back on the Vine page without any user action.
@@ -1326,78 +1397,82 @@ def _visit_and_classify_items(page: Any) -> tuple[str, str]:
         # extra navigations (that itself looks like bot traffic).
         for _ in range(2):
             page.wait_for_timeout(2500)
-            status, detail = classify_vine_page(page.content(), page.url)
+            status, detail = classify_live_page(page)
             if status != CAP_NEEDS_LOGIN:
                 break
     return status, detail
 
 
-def run_live_check(save_report: bool = True) -> dict[str, Any]:
-    result: dict[str, Any] = {
-        "connected": False,
-        "cap_status": None,
-        "cap_text": "",
-        "report": None,
-        "report_error": None,
-        "error": None,
-        "channel": None,
-        "checked_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    bootstrap_note = _ensure_session_profile()
+def _record_vine_status(
+    context: Any,
+    page: Any,
+    status: str,
+    detail: str,
+    result: dict[str, Any],
+    used_channel: str | None,
+    save_report: bool,
+) -> bool:
+    """Store a classified Vine page in `result`; on a real Vine page also fetch
+    the itemized report and persist the connection marker. Returns connected."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    result["cap_status"] = status
+    result["channel"] = used_channel
+    if status not in (CAP_OPEN, CAP_CAPPED):
+        result["error"] = LIVE_STATUS_ERRORS.get(
+            status, f"Unexpected Vine page state (URL: {detail})."
+        )
+        return False
+    result["connected"] = True
+    result["error"] = None
+    if save_report:
+        try:
+            result["report"] = download_itemized_report(context, page)
+        except (ConnectionError, LookupError, PlaywrightError, OSError) as exc:
+            result["report_error"] = str(exc)[:300]
+    _save_connection_meta(used_channel or "", connection_meta().get("source", "manual-login"))
+    return True
+
+
+def _run_live_check_locked(save_report: bool, bootstrap: bool = True) -> dict[str, Any]:
+    """Body of run_live_check; the caller must hold _browser_lock(). With
+    `bootstrap` False the existing session profile is used as it is and never
+    replaced by a copy of the user's browser profile."""
+    result = _new_live_result()
+    bootstrap_note = _ensure_session_profile() if bootstrap else None
     if bootstrap_note is not None:
         result["cap_status"] = CAP_NEEDS_LOGIN
         result["error"] = bootstrap_note
         return result
-    try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        result["error"] = (
-            "The 'playwright' package is not installed. Re-run the launcher installer, or run: "
-            "pip install playwright && python -m playwright install chromium"
-        )
-        return result
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
 
-    backed_up = False
+    connected = False
     with sync_playwright() as pw:
         context = None
         try:
             context, used_channel = _launch_vine_context(pw)
-            result["channel"] = used_channel
             page = context.pages[0] if context.pages else context.new_page()
             status, detail = _visit_and_classify_items(page)
-            if status == CAP_NEEDS_LOGIN and _restore_cookie_backup():
-                # A previous successful check left a clean authenticated
-                # snapshot; Amazon wiped the live cookies in the meantime —
-                # put them back and try one more time before asking to sign in.
+            if status == CAP_NEEDS_LOGIN and _cookie_db_has_signed_in(
+                _cookie_backup_dir() / "Cookies"
+            ):
+                # Amazon may have wiped the live cookies since the last good
+                # check. Close the browser FIRST (the cookie DB can only be
+                # swapped while nothing holds the profile), restore the
+                # authenticated snapshot, and try once more.
                 try:
                     context.close()
                 except PlaywrightError:
                     pass
-                context, used_channel = _launch_vine_context(pw)
-                result["channel"] = used_channel
-                page = context.pages[0] if context.pages else context.new_page()
-                status, detail = _visit_and_classify_items(page)
-            result["cap_status"] = status
-            if status == CAP_CAPPED:
-                result["cap_text"] = detail
-            if status in (CAP_OPEN, CAP_CAPPED):
-                result["connected"] = True
-                if save_report:
-                    try:
-                        result["report"] = download_itemized_report(context, page)
-                    except (ConnectionError, LookupError, PlaywrightError, OSError) as exc:
-                        result["report_error"] = str(exc)[:300]
-                _save_connection_meta(
-                    used_channel or "", connection_meta().get("source", "unknown")
-                )
-                backed_up = True
-            else:
-                result["error"] = {
-                    CAP_NEEDS_LOGIN: "Amazon does not recognize the saved session — sign-in required.",
-                    CAP_BLOCKED: "Amazon presented a security/bot check — use 'Sign in' to retry interactively.",
-                    CAP_UNKNOWN: f"Unexpected Vine page state (URL: {detail}).",
-                }.get(status, "Unknown connection problem.")
+                context = None
+                if _restore_cookie_backup():
+                    context, used_channel = _launch_vine_context(pw)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    status, detail = _visit_and_classify_items(page)
+            connected = _record_vine_status(
+                context, page, status, detail, result, used_channel, save_report
+            )
         except (ConnectionError, PlaywrightError) as exc:
             result["error"] = str(exc)[:400]
         finally:
@@ -1406,20 +1481,59 @@ def run_live_check(save_report: bool = True) -> dict[str, Any]:
                     context.close()
                 except PlaywrightError:
                     pass
-            if backed_up:
-                _save_cookie_backup()
+    # Only back up cookies that were just proven to work.
+    if connected:
+        _save_cookie_backup()
     return result
 
 
-def _has_signed_in_cookies(context: Any) -> bool:
+def _playwright_missing_result() -> dict[str, Any] | None:
+    try:
+        import playwright.sync_api  # noqa: F401
+    except ImportError:
+        result = _new_live_result()
+        result["error"] = (
+            "The 'playwright' package is not installed. Re-run the launcher installer, or run: "
+            "pip install playwright && python -m playwright install chromium"
+        )
+        return result
+    return None
+
+
+def run_live_check(save_report: bool = True) -> dict[str, Any]:
+    missing = _playwright_missing_result()
+    if missing is not None:
+        return missing
+    lock = _browser_lock()
+    if not lock.acquire(blocking=False):
+        result = _new_live_result()
+        result["error"] = BROWSER_BUSY_MESSAGE
+        return result
+    try:
+        return _run_live_check_locked(save_report)
+    finally:
+        lock.release()
+
+
+def _auth_cookie_value(context: Any) -> str | None:
     from playwright.sync_api import Error as PlaywrightError
 
     try:
         cookies = context.cookies("https://www.amazon.com")
     except PlaywrightError:
-        return False
-    names = {str(cookie.get("name", "")) for cookie in cookies}
-    return bool(names & SIGNED_IN_COOKIE_NAMES)
+        return None
+    for cookie in cookies:
+        if str(cookie.get("name", "")) in SIGNED_IN_COOKIE_NAMES:
+            return str(cookie.get("value", ""))
+    return None
+
+
+def _on_login_wall(url: str) -> bool:
+    return "/ap/" in url or any(marker in url for marker in LOGIN_WALL_URL_MARKERS)
+
+
+def _is_vine_url(url: str) -> bool:
+    return "amazon.com/vine" in url and not _on_login_wall(url)
 
 
 def _save_login_attempt_snapshot(pages: list[Any]) -> None:
@@ -1431,105 +1545,167 @@ def _save_login_attempt_snapshot(pages: list[Any]) -> None:
     for index, page in enumerate(pages):
         try:
             url = page.url
+            content = page.content()
         except PlaywrightError:
             continue
-        path = debug_dir / f"login_attempt_{stamp}_{index}.html"
+        header = (
+            f"<!-- url: {url}\n"
+            f"     saved: {datetime.now().isoformat(timespec='seconds')} -->\n"
+        )
         try:
-            path.write_text(page.content(), encoding="utf-8")
-            header = (
-                f"<!-- url: {url}\n"
-                f"     saved: {datetime.now().isoformat(timespec='seconds')} -->\n"
+            (debug_dir / f"login_attempt_{stamp}_{index}.html").write_text(
+                header + content, encoding="utf-8"
             )
-            path.write_text(header + path.read_text(encoding="utf-8"), encoding="utf-8")
-        except (PlaywrightError, OSError):
+        except OSError:
             continue
 
 
-def perform_interactive_login(progress: Any = None) -> tuple[bool, str]:
+def _wait_for_sign_in(context: Any, say: Any) -> tuple[str, Any | None, str]:
+    """
+    Let the user sign in inside the open window. Returns (outcome, vine_page,
+    last_url) where outcome is "ok", "closed" or "timeout".
+
+    Success means a tab is actually showing a Vine page (not a sign-in URL).
+    The mere presence of the at-main cookie is NOT trusted: a stale one from a
+    copied profile or an expired session is already in the jar when the window
+    opens, which used to close the window instantly. A *newly issued* at-main
+    only triggers a probe in a separate tab, so the user's own tab is never
+    navigated away mid-sign-in (e.g. during MFA).
+    """
+    from playwright.sync_api import Error as PlaywrightError
+
+    page = context.pages[0] if context.pages else context.new_page()
+    seen_token = _auth_cookie_value(context)
     try:
-        from playwright.sync_api import Error as PlaywrightError
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return False, "The 'playwright' package is not installed."
+        page.goto(VINE_ITEMS_URL, wait_until="domcontentloaded", timeout=60000)
+    except PlaywrightError:
+        pass  # sign-in redirects can hang; keep polling either way
+    say(
+        "Browser window opened — sign in to Amazon there. It closes by itself once "
+        "the Vine page loads (up to 15 minutes)."
+    )
+    deadline = time.monotonic() + SIGN_IN_TIMEOUT_SECONDS
+    next_notice = time.monotonic() + 30.0
+    last_url = ""
+    while time.monotonic() < deadline:
+        try:
+            pages = [p for p in context.pages if not p.is_closed()]
+        except PlaywrightError:
+            return "closed", None, last_url
+        if not pages:
+            return "closed", None, last_url
+        urls: list[tuple[Any, str]] = []
+        for candidate in pages:
+            try:
+                urls.append((candidate, candidate.url))
+            except PlaywrightError:
+                continue
+        for candidate, url in urls:
+            if _is_vine_url(url):
+                return "ok", candidate, url
+        if urls:
+            last_url = urls[0][1]
+
+        token = _auth_cookie_value(context)
+        if token and token != seen_token:
+            seen_token = token
+            probe = None
+            try:
+                probe = context.new_page()
+                probe.goto(VINE_ITEMS_URL, wait_until="domcontentloaded", timeout=45000)
+                probe.wait_for_timeout(1500)
+                if _is_vine_url(probe.url):
+                    return "ok", probe, probe.url
+            except PlaywrightError:
+                pass
+            if probe is not None:
+                try:
+                    probe.close()
+                except PlaywrightError:
+                    pass
+
+        if time.monotonic() >= next_notice:
+            next_notice = time.monotonic() + 30.0
+            minutes_left = max(0, int((deadline - time.monotonic()) // 60))
+            say(
+                f"Still waiting for sign-in… about {minutes_left} min left. "
+                f"Current page: {last_url[:120] or '(blank)'}"
+            )
+        time.sleep(SIGN_IN_POLL_SECONDS)
+    return "timeout", None, last_url
+
+
+def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str, Any]:
+    """
+    Open a visible browser on the session profile, let the user sign in, then
+    check the Vine status and download the report in the SAME window. Reusing
+    the window avoids the old close-then-relaunch race on the profile lock.
+    Returns a result dict shaped like run_live_check().
+    """
 
     def say(message: str) -> None:
         if progress is not None:
             progress(message)
 
-    deadline = time.monotonic() + 900.0
-    with sync_playwright() as pw:
-        context = None
-        last_seen_url = ""
-        try:
-            context, used_channel = _launch_vine_context(pw, headless=False)
-            page = context.pages[0] if context.pages else context.new_page()
+    missing = _playwright_missing_result()
+    if missing is not None:
+        return missing
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    lock = _browser_lock()
+    if not lock.acquire(blocking=False):
+        result = _new_live_result()
+        result["error"] = BROWSER_BUSY_MESSAGE
+        return result
+    try:
+        result = _new_live_result()
+        connected = False
+        outcome = ""
+        with sync_playwright() as pw:
+            context = None
             try:
-                page.goto(VINE_ITEMS_URL, wait_until="domcontentloaded", timeout=60000)
-            except PlaywrightError:
-                pass  # sign-in redirects can hang; keep polling either way
-            say(
-                "Browser window opened — sign in there. It closes by itself as soon "
-                "as the Vine page loads or an authenticated session cookie appears."
-            )
-            polls = 0
-            while time.monotonic() < deadline:
-                try:
-                    pages = list(context.pages)
-                except PlaywrightError:
-                    break
-                if not pages:
-                    return False, "The sign-in window was closed before sign-in finished."
-                polls += 1
-                if polls % 20 == 0:
-                    minutes_left = max(0, int((deadline - time.monotonic()) // 60))
-                    say(
-                        f"Still waiting for sign-in… about {minutes_left} min left. "
-                        f"Current page: {last_seen_url[:120] or '(blank)'}"
+                context, used_channel = _launch_vine_context(pw, headless=False)
+                result["channel"] = used_channel
+                outcome, vine_page, last_url = _wait_for_sign_in(context, say)
+                if outcome == "ok":
+                    say("Signed in — checking claim status and downloading the latest report...")
+                    vine_page.wait_for_timeout(1500)
+                    status, detail = classify_live_page(vine_page)
+                    connected = _record_vine_status(
+                        context, vine_page, status, detail, result, used_channel, save_report
                     )
-                try:
-                    urls = [candidate.url for candidate in pages]
-                except PlaywrightError:
-                    urls = []
-                if urls:
-                    last_seen_url = urls[0]
-                landed_on_vine = any(
-                    "amazon.com/vine" in candidate and "/ap/" not in candidate
-                    for candidate in urls
-                )
-                # Success signals:
-                # 1) the login flow opened a real Vine page in this window
-                #    (openid.return_to is vine-items);
-                # 2) the authenticated at-main cookie exists — accept it even if
-                #    the first tab still shows its /ap/signin URL: Amazon sometimes
-                #    completes sign-in without ever redirecting that tab (Vine
-                #    appears in a separate window that Playwright may not track).
-                #    at-main is only ever issued on a fully completed sign-in, so
-                #    unlike lc-main/session-id it needs no sign-in-wall guard.
-                if landed_on_vine or _has_signed_in_cookies(context):
-                    _save_connection_meta(
-                        used_channel or "",
-                        connection_meta().get("source", "manual-login"),
+                elif outcome == "timeout":
+                    _save_login_attempt_snapshot(list(context.pages))
+                    result["cap_status"] = CAP_NEEDS_LOGIN
+                    result["error"] = (
+                        "Timed out waiting for sign-in to finish "
+                        f"(window's last page: {last_url[:160] or '(unknown)'}). "
+                        "If your account is not a Vine member the Vine page never loads. "
+                        "A page copy was saved under vine_reports/debug/."
                     )
-                    say("Signed in — verifying the session and fetching status now.")
-                    return True, ""
-                time.sleep(1.5)
-            _save_login_attempt_snapshot(list(context.pages))
-            return (
-                False,
-                (
-                    "Timed out waiting for sign-in to finish "
-                    f"(window's last page: {last_seen_url[:160] or '(unknown)'}). "
-                    "A page copy was saved under vine_reports/debug/ for debugging."
-                ),
-            )
-        except ConnectionError as exc:
-            return False, str(exc)
-        finally:
-            if context is not None:
-                try:
-                    context.close()
-                except PlaywrightError:
-                    pass
+            except (ConnectionError, PlaywrightError) as exc:
+                result["error"] = str(exc)[:400]
+            finally:
+                if context is not None:
+                    try:
+                        context.close()
+                    except PlaywrightError:
+                        pass
+        if connected:
+            _save_cookie_backup()
+        elif outcome == "closed":
+            # The browser writes cookies to disk as it exits, so a sign-in the
+            # user finished right before closing the window shows up only now.
+            say("The window was closed — checking whether the sign-in went through...")
+            # Use the session as the window left it: copying a browser profile
+            # over it would throw away a sign-in that is partly done.
+            result = _run_live_check_locked(save_report, bootstrap=False)
+            if not result.get("connected"):
+                result["error"] = "The sign-in window was closed before sign-in finished."
+        return result
+    finally:
+        lock.release()
 
 
 def perform_connect(progress: Any = None) -> dict[str, Any]:
@@ -1539,32 +1715,15 @@ def perform_connect(progress: Any = None) -> dict[str, Any]:
 
     say("Trying your saved Amazon session first (silent re-check)...")
     result = run_live_check()
-    error_text = str(result.get("error") or "").lower()
-    if result.get("connected") or "not installed" in error_text:
+    error_text = str(result.get("error") or "")
+    if (
+        result.get("connected")
+        or "not installed" in error_text
+        or error_text == BROWSER_BUSY_MESSAGE
+    ):
         return result
-
     say("No usable saved session — opening a one-time Amazon sign-in window.")
-    login_ok, login_detail = perform_interactive_login(progress=progress)
-    say("Re-checking the session and downloading the latest report "
-        "(a Chrome window will appear briefly)...")
-    # Give the login window's browser process time to fully exit and flush
-    # cookies to disk before the re-check opens the same profile.
-    # The re-check is run even if detection ended ambiguous (e.g. the user
-    # closed the window themselves right after finishing sign-in).
-    time.sleep(2.5)
-    _save_cookie_backup()
-    recheck = run_live_check()
-    if recheck.get("connected") or login_ok:
-        return recheck
-
-    if recheck.get("error") or recheck.get("cap_status"):
-        if login_detail and not recheck.get("error"):
-            recheck["error"] = login_detail
-        return recheck
-    if not result.get("error"):
-        result["error"] = login_detail or "Interactive sign-in window did not complete."
-    result["connected"] = False
-    return result
+    return perform_sign_in(progress=progress)
 
 
 def save_debug_snapshot() -> tuple[list[str], str | None]:
@@ -1573,6 +1732,18 @@ def save_debug_snapshot() -> tuple[list[str], str | None]:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return [], "The 'playwright' package is not installed."
+    lock = _browser_lock()
+    if not lock.acquire(blocking=False):
+        return [], BROWSER_BUSY_MESSAGE
+    try:
+        return _save_debug_snapshot_locked(PlaywrightError, sync_playwright)
+    finally:
+        lock.release()
+
+
+def _save_debug_snapshot_locked(
+    PlaywrightError: Any, sync_playwright: Any
+) -> tuple[list[str], str | None]:
     debug_dir = _reports_dir() / "debug"
     debug_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -1596,7 +1767,7 @@ def save_debug_snapshot() -> tuple[list[str], str | None]:
                     html_path.write_text(content, encoding="utf-8")
                     meta_path.write_text(
                         f"url: {page.url}\n"
-                        f"classification: {classify_vine_page(content, page.url)}\n",
+                        f"classification: {classify_vine_page(content, page.url, _visible_text(page))}\n",
                         encoding="utf-8",
                     )
                     page.screenshot(path=str(png_path), full_page=True)
@@ -1727,6 +1898,7 @@ def main() -> None:
 
         auto_reports = list_auto_reports()
         selected_auto_report: str | None = None
+        prior_year_report: Path | None = None
         if auto_reports:
             use_auto = st.checkbox(
                 "Use latest auto-downloaded Vine report",
@@ -1735,7 +1907,8 @@ def main() -> None:
                 help=f"Newest of {len(auto_reports)} auto-download(s): {auto_reports[0].name}",
             )
             if use_auto:
-                selected_auto_report = str(auto_reports[0])
+                primary_report, prior_year_report = pick_auto_reports(auto_reports)
+                selected_auto_report = str(primary_report)
 
         use_demo = st.checkbox(
             "Load built-in sample report",
@@ -1781,14 +1954,9 @@ def main() -> None:
                     def _sign_in_progress(message: str) -> None:
                         st.write(message)
 
-                    signed_in, detail = perform_interactive_login(progress=_sign_in_progress)
-                    if not signed_in and detail:
-                        st.write(f"⚠️ {detail}")
-                    st.write("Verifying the session and fetching the latest status "
-                             "(a Chrome window will appear briefly)...")
-                    time.sleep(2.5)
-                    _save_cookie_backup()
-                    result = run_live_check()
+                    result = perform_sign_in(progress=_sign_in_progress)
+                    if not result.get("connected") and result.get("error"):
+                        st.write(f"⚠️ {result['error']}")
                     st.session_state["vine_live"] = result
                     if result.get("connected"):
                         status.update(label="Connected to Amazon Vine", state="complete")
@@ -1966,6 +2134,39 @@ def main() -> None:
         st.error(f"**Unexpected error while reading file:** {exc}")
         return
 
+    # The current year's rows, for the annual figures, before any prior year is added.
+    year_df = df
+    report_year = meta["max_order_date"].year
+    window_start_year = (
+        pd.Timestamp(date.today()) - pd.Timedelta(days=int(window_length))
+    ).year
+    if (
+        selected_auto_report is not None
+        and prior_year_report is not None
+        and window_start_year < report_year
+    ):
+        try:
+            prior_df, prior_meta = _load_vine_excel_bytes(prior_year_report.read_bytes())
+        except (ValueError, OSError, RuntimeError, KeyError) as exc:
+            st.warning(
+                f"Could not read last year's report `{prior_year_report.name}` ({exc}); "
+                "the rolling window may miss orders from before New Year."
+            )
+        else:
+            df = (
+                pd.concat([prior_df, df], ignore_index=True)
+                .sort_values(by="Order Date", ascending=True)
+                .reset_index(drop=True)
+            )
+            meta = {
+                **meta,
+                "valid_rows": len(df),
+                "skipped_footer_rows": meta["skipped_footer_rows"] + prior_meta["skipped_footer_rows"],
+                "malformed_rows": meta["malformed_rows"] + prior_meta["malformed_rows"],
+                "min_order_date": df["Order Date"].min(),
+            }
+            source_label += f" + {prior_year_report.name}"
+
     # -----------------------------------------------------------------------
     # Base Date Selection (Sidebar extension once file is loaded)
     # -----------------------------------------------------------------------
@@ -2010,11 +2211,12 @@ def main() -> None:
     )
 
     current_window_total = float(proj_df.iloc[0]["Projected Total"])
-    total_annual_tax_value = round(float(df["Estimated Tax Value"].sum()), 2)
+    total_annual_tax_value = round(float(year_df["Estimated Tax Value"].sum()), 2)
     timeframe_summary_df = compute_timeframe_summary(
         df=df,
         base_date=base_date,
         inclusive_start=False,
+        year_df=year_df,
     )
 
     # Format Threshold Crossing KPI display
@@ -2028,15 +2230,18 @@ def main() -> None:
             crossing_headline = f"{c_date_str} — {c_val_str}"
             crossing_sub = f"In {crossing_info['day_offset']} day(s) from Base Date"
     else:
-        # Check when it eventually crosses even beyond the chosen horizon
-        _extended_df, extended_crossing = generate_decay_projection(
-            df=df,
-            base_date=base_date,
-            window_days=int(window_length),
-            threshold=float(tax_threshold),
-            horizon_days=max(int(window_length), int(projection_horizon)),
-            inclusive_start=False,
-        )
+        # A shorter horizon than the window may stop before the crossing: look as far
+        # as the window. A longer one already covered it, so there's nothing to redo.
+        extended_crossing = None
+        if int(projection_horizon) < int(window_length):
+            _extended_df, extended_crossing = generate_decay_projection(
+                df=df,
+                base_date=base_date,
+                window_days=int(window_length),
+                threshold=float(tax_threshold),
+                horizon_days=int(window_length),
+                inclusive_start=False,
+            )
         if extended_crossing is not None:
             c_date_str = extended_crossing["date"].strftime("%B %d, %Y")
             c_val_str = f"${extended_crossing['projected_total']:,.2f}"
@@ -2081,7 +2286,7 @@ def main() -> None:
         st.metric(
             label="Total Annual Tax Value",
             value=f"${total_annual_tax_value:,.2f}",
-            delta=f"{len(df):,} net line items",
+            delta=f"{len(year_df):,} net line items",
             delta_color="off",
         )
 
@@ -2117,14 +2322,11 @@ def main() -> None:
                     "have not shipped yet or are otherwise missing from the itemized report."
                 )
             st.error(
-                f"🚫 **Live Amazon check:** claiming is currently **PAUSED** (ETV cap reached). "
-                f"{live_result.get('cap_text') or ''}{mismatch_note}"
+                "🚫 **Claiming is paused.** Amazon has paused your Vine claiming because "
+                f"your ETV cap was reached.{mismatch_note}"
             )
         elif live_cap_status == CAP_OPEN:
-            st.success(
-                f"✅ **Live Amazon check:** claiming is currently **open** "
-                f"(checked {str(live_result.get('checked_at', ''))[:19].replace('T', ' ')})."
-            )
+            st.success("✅ **Claiming is online**")
         elif live_cap_status in (CAP_NEEDS_LOGIN, CAP_BLOCKED):
             st.warning(
                 f"🟠 **Live Amazon check unavailable:** {live_result.get('error') or 'Sign-in required.'} "
