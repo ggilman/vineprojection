@@ -1867,6 +1867,9 @@ def main() -> None:
             padding: 14px 18px;
             box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
         }
+        div[data-testid="stMetricValue"] {
+            font-size: clamp(1.35rem, 2.2vw, 2rem);
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -2230,16 +2233,24 @@ def main() -> None:
         year_df=year_df,
     )
 
-    # Format Threshold Crossing KPI display
+    # Format Threshold Crossing KPI display. The value is just the short date (or a
+    # two-word status) so it fits the card; the amount and timing go underneath.
+    def _short_date(ts: pd.Timestamp) -> str:
+        # "Dec 4"; the year is added only when it differs from the base date's.
+        text = f"{ts:%b} {ts.day}"
+        return text if ts.year == base_date.year else f"{text}, {ts.year}"
+
+    def _days(n: int) -> str:
+        return f"{n} day" if n == 1 else f"{n} days"
+
     if crossing_info is not None:
-        c_date_str = crossing_info["date"].strftime("%B %d, %Y")
         c_val_str = f"${crossing_info['projected_total']:,.2f}"
         if crossing_info["already_below"]:
-            crossing_headline = f"Currently Under ({c_val_str})"
-            crossing_sub = f"As of {c_date_str} (Day 0)"
+            crossing_headline = "Under now"
+            crossing_sub = f"{c_val_str} as of {_short_date(crossing_info['date'])}"
         else:
-            crossing_headline = f"{c_date_str} — {c_val_str}"
-            crossing_sub = f"In {crossing_info['day_offset']} day(s) from Base Date"
+            crossing_headline = _short_date(crossing_info["date"])
+            crossing_sub = f"{c_val_str} · in {_days(crossing_info['day_offset'])}"
     else:
         # A shorter horizon than the window may stop before the crossing: look as far
         # as the window. A longer one already covered it, so there's nothing to redo.
@@ -2254,19 +2265,20 @@ def main() -> None:
                 inclusive_start=False,
             )
         if extended_crossing is not None:
-            c_date_str = extended_crossing["date"].strftime("%B %d, %Y")
             c_val_str = f"${extended_crossing['projected_total']:,.2f}"
-            crossing_headline = f"{c_date_str} — {c_val_str}"
-            crossing_sub = f"Outside {projection_horizon}d horizon (Day +{extended_crossing['day_offset']})"
+            crossing_headline = _short_date(extended_crossing["date"])
+            crossing_sub = (
+                f"{c_val_str} · in {_days(extended_crossing['day_offset'])} (past horizon)"
+            )
         else:
-            crossing_headline = "Not Reached in Horizon"
-            crossing_sub = f"Remains >= ${tax_threshold:,.2f} through +{projection_horizon}d"
+            crossing_headline = "Not reached"
+            crossing_sub = f"Stays ≥ ${tax_threshold:,.2f} for {_days(int(projection_horizon))}"
 
     # -----------------------------------------------------------------------
     # 1. Top Header & KPI Scorecards
     # -----------------------------------------------------------------------
     st.subheader("Key Performance Indicators")
-    kpi1, kpi2, kpi3, kpi4 = st.columns([1, 1, 1.45, 1])
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
 
     variance_now = round(current_window_total - float(tax_threshold), 2)
     with kpi1:
