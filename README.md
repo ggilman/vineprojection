@@ -96,12 +96,13 @@ Once the application opens in your browser (`http://localhost:8501`):
 
 2. **Configure Projection Parameters (Left Sidebar -> `2. Projection Parameters`):**
    - **Rolling Window Length (Days):** Number of trailing days in the rolling window (default: `30` days).
+   - **Count Items By:** `Ship Date` *(default)* places each item in the window by its Shipped Date (cancellations, which never ship, use their Cancelled Date); `Order Date` uses the date you ordered it.
    - **Tax Threshold ($):** Target dollar threshold to monitor (default: `$6,000.00`).
    - **Projection Horizon (Days):** Number of future days to project (defaults to matching your window length, or uncheck **Match Projection Horizon to Window Length** to enter a custom horizon).
 
 3. **Choose Base Date (Left Sidebar -> `3. Base Date Settings`):**
    - **Today's Date** *(default)* — Projects decay starting from today.
-   - **Latest Order Date** — Projects decay starting from the most recent order date in your report.
+   - **Latest Ship Date / Latest Order Date** — Projects decay starting from the most recent ship (or order) date in your report, matching **Count Items By**.
    - **Custom Date** — Pick any reference date on the calendar.
 
 4. **Exit the Application:**
@@ -137,7 +138,7 @@ Once the application opens in your browser (`http://localhost:8501`):
 ## Features & Dashboard Overview
 
 1. **Dynamic Excel Report Loading (`.xlsx`):**
-   - Automatically locates the itemized transaction table (`Order Date`, `Estimated Tax Value`, `Order Type`, `Cancelled Date`) regardless of how many summary or title rows appear at the top of the worksheet.
+   - Automatically locates the itemized transaction table (`Order Date`, `Shipped Date`, `Estimated Tax Value`, `Order Type`, `Cancelled Date`) regardless of how many summary or title rows appear at the top of the worksheet.
    - Automatically strips out footer notes, FAQ text, and blank rows at the bottom of the worksheet.
    - Normalizes currency strings (`$1,234.56`, `($45.00)`, `-$45.00`) and ensures `CANCELLATION` rows carry negative tax values.
 

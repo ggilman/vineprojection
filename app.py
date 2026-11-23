@@ -65,6 +65,13 @@ REQUIRED_COLUMNS: dict[str, list[str]] = {
 
 OPTIONAL_COLUMNS: dict[str, list[str]] = {
     "order_type": ["order type", "ordertype", "type", "transaction type"],
+    "shipped_date": [
+        "shipped date",
+        "ship date",
+        "shipping date",
+        "shipment date",
+        "date shipped",
+    ],
     "cancelled_date": [
         "cancelled date",
         "canceled date",
@@ -81,6 +88,14 @@ OPTIONAL_COLUMNS: dict[str, list[str]] = {
         "product description",
     ],
 }
+
+
+# Which date places a row in the rolling window. "Ship" uses Shipped Date, falling
+# back to Cancelled Date for cancellations (they never ship) and then Order Date.
+DATE_BASIS_SHIP = "Ship Date"
+DATE_BASIS_ORDER = "Order Date"
+DATE_BASIS_OPTIONS = [DATE_BASIS_SHIP, DATE_BASIS_ORDER]
+BASIS_COL = "Basis Date"
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +327,7 @@ def load_vine_excel(file_source: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
     etv_idx = col_map["etv"]
     order_type_idx = col_map.get("order_type")
     cancelled_date_idx = col_map.get("cancelled_date")
+    shipped_date_idx = col_map.get("shipped_date")
     order_num_idx = col_map.get("order_number")
     asin_idx = col_map.get("asin")
     product_name_idx = col_map.get("product_name")
@@ -358,8 +374,13 @@ def load_vine_excel(file_source: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
         if cancelled_date_idx is not None:
             parsed_cancelled_date = _parse_datetime(row.iloc[cancelled_date_idx])
 
+        parsed_shipped_date = None
+        if shipped_date_idx is not None:
+            parsed_shipped_date = _parse_datetime(row.iloc[shipped_date_idx])
+
         record: dict[str, Any] = {
             "Order Date": parsed_order_date,
+            "Shipped Date": parsed_shipped_date,
             "Estimated Tax Value": round(parsed_etv, 2),
             "Order Type": order_type_val,
             "Cancelled Date": parsed_cancelled_date,
@@ -397,9 +418,28 @@ def load_vine_excel(file_source: Any) -> tuple[pd.DataFrame, dict[str, Any]]:
         "malformed_rows": malformed_rows,
         "min_order_date": cleaned_df["Order Date"].min(),
         "max_order_date": cleaned_df["Order Date"].max(),
+        "has_shipped_date": shipped_date_idx is not None,
     }
 
     return cleaned_df, metadata
+
+
+def apply_date_basis(df: pd.DataFrame, basis: str) -> pd.DataFrame:
+    """
+    Return a copy of `df` with a `Basis Date` column, the date every calculation
+    uses, sorted by it. Ship basis: Shipped Date, else Cancelled Date (cancellations
+    never ship), else Order Date. Order basis: Order Date.
+    """
+    out = df.copy()
+    if basis == DATE_BASIS_SHIP:
+        basis_dates = pd.to_datetime(out["Shipped Date"], errors="coerce")
+        if "Cancelled Date" in out.columns:
+            basis_dates = basis_dates.fillna(pd.to_datetime(out["Cancelled Date"], errors="coerce"))
+        basis_dates = basis_dates.fillna(out["Order Date"])
+    else:
+        basis_dates = out["Order Date"]
+    out[BASIS_COL] = pd.to_datetime(basis_dates).dt.normalize()
+    return out.sort_values(by=BASIS_COL, ascending=True, kind="stable").reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -415,10 +455,10 @@ def compute_rolling_window_total(
 ) -> float:
     """
     Calculate the sum of `Estimated Tax Value` for orders within the trailing
-    window ending on `target_date`.
+    window ending on `target_date`, placing each row by its `Basis Date`.
 
     By specification:
-      - For Day D, items ordered in `(D - Window Length, D]` are summed.
+      - For Day D, items dated in `(D - Window Length, D]` are summed.
       - When `inclusive_start` is False (default), interval is `(D - window_days, D]`,
         which spans `window_days` calendar days ending on D.
       - When `inclusive_start` is True, interval is `[D - window_days, D]`.
@@ -427,9 +467,9 @@ def compute_rolling_window_total(
     cutoff_ts = target_ts - pd.Timedelta(days=int(window_days))
 
     if inclusive_start:
-        mask = (df["Order Date"] >= cutoff_ts) & (df["Order Date"] <= target_ts)
+        mask = (df[BASIS_COL] >= cutoff_ts) & (df[BASIS_COL] <= target_ts)
     else:
-        mask = (df["Order Date"] > cutoff_ts) & (df["Order Date"] <= target_ts)
+        mask = (df[BASIS_COL] > cutoff_ts) & (df[BASIS_COL] <= target_ts)
 
     total = float(df.loc[mask, "Estimated Tax Value"].sum())
     return round(total, 2)
@@ -524,10 +564,10 @@ def compute_timeframe_summary(
     for label, days in periods:
         cutoff = base_ts - pd.Timedelta(days=days)
         if inclusive_start:
-            sub = df[(df["Order Date"] >= cutoff) & (df["Order Date"] <= base_ts)]
+            sub = df[(df[BASIS_COL] >= cutoff) & (df[BASIS_COL] <= base_ts)]
             start_display = cutoff.strftime("%Y-%m-%d")
         else:
-            sub = df[(df["Order Date"] > cutoff) & (df["Order Date"] <= base_ts)]
+            sub = df[(df[BASIS_COL] > cutoff) & (df[BASIS_COL] <= base_ts)]
             start_display = (cutoff + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
 
         orders_mask = sub["Estimated Tax Value"] > 0
@@ -552,8 +592,8 @@ def compute_timeframe_summary(
 
     # Full Year / Cumulative Total across all valid rows in the report
     df = df if year_df is None else year_df
-    min_d = df["Order Date"].min().strftime("%Y-%m-%d")
-    max_d = df["Order Date"].max().strftime("%Y-%m-%d")
+    min_d = df[BASIS_COL].min().strftime("%Y-%m-%d")
+    max_d = df[BASIS_COL].max().strftime("%Y-%m-%d")
     orders_mask_all = df["Estimated Tax Value"] > 0
     cancels_mask_all = df["Estimated Tax Value"] < 0
 
@@ -1807,31 +1847,32 @@ def build_demo_excel_bytes() -> bytes:
     rows = [
         ["Amazon Vine Itemized Tax Report - Tax Year 2026", None, None, None, None, None, None],
         ["Account Holder: Sample Vine Voice", None, None, None, None, None, None],
-        [None, None, None, None, None, None, None],
+        [None, None, None, None, None, None, None, None],
         [
             "Order Number",
             "ASIN",
             "Product Name",
             "Order Type",
             "Order Date",
+            "Shipped Date",
             "Cancelled Date",
             "Estimated Tax Value",
         ],
-        ["112-0000001-00001", "B00DEMO001", "4K OLED Portable Monitor", "ORDER", "2026-08-14", None, 429.99],
-        ["112-0000001-00002", "B00DEMO002", "Commercial Espresso Machine", "ORDER", "2026-09-05", None, 899.00],
-        ["112-0000001-00003", "B00DEMO003", "Ergonomic Mesh Office Chair", "ORDER", "2026-09-22", None, 540.00],
-        ["112-0000001-00004", "B00DEMO004", "Smart Robot Vacuum & Mop", "ORDER", "2026-10-08", None, 780.00],
-        ["112-0000001-00005", "B00DEMO005", "Wireless Mechanical Keyboard", "ORDER", "2026-10-21", None, 199.50],
-        ["112-0000001-00006", "B00DEMO006", "Laser Home Theater Projector", "ORDER", "2026-10-25", None, 2199.99],
-        ["112-0000001-00007", "B00DEMO007", "Portable Power Station 2000W", "ORDER", "2026-10-28", None, 1499.00],
-        ["112-0000001-00008", "B00DEMO008", "Titanium Cookware 12pc Set", "ORDER", "2026-10-31", None, 766.09],
-        ["112-0000001-00009", "B00DEMO009", "Studio Condenser Microphone", "ORDER", "2026-11-02", None, 349.99],
-        ["112-0000001-00009", "B00DEMO009", "Studio Condenser Microphone", "CANCELLATION", "2026-11-02", "2026-11-03", -349.99],
-        ["112-0000001-00010", "B00DEMO010", "Carbon Road Bike Wheelset", "ORDER", "2026-11-05", None, 1850.00],
-        ["112-0000001-00011", "B00DEMO011", "Dual-Zone Wine Cooler Fridge", "ORDER", "2026-11-09", None, 1299.00],
-        ["112-0000001-00012", "B00DEMO012", "Full-Frame Mirrorless Lens 35mm", "ORDER", "2026-11-12", None, 1498.00],
-        ["112-0000001-00013", "B00DEMO013", "Smart Home Gym Cable System", "ORDER", "2026-11-16", None, 880.09],
-        [None, None, None, None, None, None, None],
+        ["112-0000001-00001", "B00DEMO001", "4K OLED Portable Monitor", "ORDER", "2026-08-14", "2026-08-16", None, 429.99],
+        ["112-0000001-00002", "B00DEMO002", "Commercial Espresso Machine", "ORDER", "2026-09-05", "2026-09-07", None, 899.00],
+        ["112-0000001-00003", "B00DEMO003", "Ergonomic Mesh Office Chair", "ORDER", "2026-09-22", "2026-09-24", None, 540.00],
+        ["112-0000001-00004", "B00DEMO004", "Smart Robot Vacuum & Mop", "ORDER", "2026-10-08", "2026-10-10", None, 780.00],
+        ["112-0000001-00005", "B00DEMO005", "Wireless Mechanical Keyboard", "ORDER", "2026-10-21", "2026-10-23", None, 199.50],
+        ["112-0000001-00006", "B00DEMO006", "Laser Home Theater Projector", "ORDER", "2026-10-25", "2026-10-27", None, 2199.99],
+        ["112-0000001-00007", "B00DEMO007", "Portable Power Station 2000W", "ORDER", "2026-10-28", "2026-10-30", None, 1499.00],
+        ["112-0000001-00008", "B00DEMO008", "Titanium Cookware 12pc Set", "ORDER", "2026-10-31", "2026-11-02", None, 766.09],
+        ["112-0000001-00009", "B00DEMO009", "Studio Condenser Microphone", "ORDER", "2026-11-02", "2026-11-04", None, 349.99],
+        ["112-0000001-00009", "B00DEMO009", "Studio Condenser Microphone", "CANCELLATION", "2026-11-02", None, "2026-11-03", -349.99],
+        ["112-0000001-00010", "B00DEMO010", "Carbon Road Bike Wheelset", "ORDER", "2026-11-05", "2026-11-07", None, 1850.00],
+        ["112-0000001-00011", "B00DEMO011", "Dual-Zone Wine Cooler Fridge", "ORDER", "2026-11-09", "2026-11-11", None, 1299.00],
+        ["112-0000001-00012", "B00DEMO012", "Full-Frame Mirrorless Lens 35mm", "ORDER", "2026-11-12", "2026-11-14", None, 1498.00],
+        ["112-0000001-00013", "B00DEMO013", "Smart Home Gym Cable System", "ORDER", "2026-11-16", "2026-11-18", None, 880.09],
+        [None, None, None, None, None, None, None, None],
         ["Frequently Asked Questions (FAQ)", None, None, None, None, None, None],
         ["Q: Why does a cancelled order appear twice?", "A: Cancelled orders are offset with a negative Estimated Tax Value.", None, None, None, None, None],
         ["Note: This report is provided for informational purposes only.", None, None, None, None, None, None],
@@ -2041,6 +2082,18 @@ def main() -> None:
             help="Number of trailing days included in the rolling window (default: 30 days).",
         )
 
+        date_basis = st.radio(
+            "Count Items By",
+            options=DATE_BASIS_OPTIONS,
+            index=0,
+            horizontal=True,
+            help=(
+                "Which date places an item in the rolling window. Ship Date uses the "
+                "Shipped Date (cancellations use their Cancelled Date, since they never "
+                "ship); Order Date uses the date the item was ordered."
+            ),
+        )
+
         tax_threshold = st.number_input(
             "Tax Threshold ($)",
             min_value=0.0,
@@ -2124,6 +2177,7 @@ def main() -> None:
                 and strips out FAQ/footer notes at the bottom.
 
                 - **`Order Date`**: Date the Vine order was placed.
+                - **`Shipped Date`**: Date the item shipped (used by default to place items in the window).
                 - **`Estimated Tax Value`**: Numeric dollar value (negative for cancellations).
                 - **`Order Type`**: e.g., `ORDER`, `CANCELLATION` (automatically inferred if omitted).
                 - **`Cancelled Date`**: Date of cancellation (if present).
@@ -2181,10 +2235,20 @@ def main() -> None:
             }
             source_label += f" + {prior_year_report.name}"
 
+    # Place every row by the chosen date (Ship or Order) for all calculations.
+    df = apply_date_basis(df, date_basis)
+    year_df = apply_date_basis(year_df, date_basis)
+    if date_basis == DATE_BASIS_SHIP and not meta.get("has_shipped_date", False):
+        st.warning(
+            "This report has no Shipped Date column, so items are counted by Order Date "
+            "(cancellations by Cancelled Date)."
+        )
+
     # -----------------------------------------------------------------------
     # Base Date Selection (Sidebar extension once file is loaded)
     # -----------------------------------------------------------------------
-    latest_order_date: pd.Timestamp = meta["max_order_date"]
+    latest_basis_date: pd.Timestamp = df[BASIS_COL].max()
+    latest_basis_label = "Latest Ship Date" if date_basis == DATE_BASIS_SHIP else "Latest Order Date"
     today_ts = pd.Timestamp(date.today()).normalize()
 
     with base_date_container:
@@ -2194,7 +2258,7 @@ def main() -> None:
             "Base Date (Day 0)",
             options=[
                 f"Today's Date ({today_ts.strftime('%Y-%m-%d')})",
-                f"Latest Order Date ({latest_order_date.strftime('%Y-%m-%d')})",
+                f"{latest_basis_label} ({latest_basis_date.strftime('%Y-%m-%d')})",
                 "Custom Date",
             ],
             index=0,
@@ -2203,8 +2267,8 @@ def main() -> None:
 
         if base_date_mode.startswith("Today's Date"):
             base_date = today_ts
-        elif base_date_mode.startswith("Latest Order Date"):
-            base_date = latest_order_date
+        elif base_date_mode.startswith(latest_basis_label):
+            base_date = latest_basis_date
         else:
             picked_date = st.date_input(
                 "Select Custom Base Date",
@@ -2376,7 +2440,8 @@ def main() -> None:
     with col_left:
         st.subheader("Timeframe Summary Table")
         st.caption(
-            f"Rolling period totals calculated relative to Base Date ({base_date.strftime('%Y-%m-%d')})."
+            f"Rolling period totals calculated relative to Base Date ({base_date.strftime('%Y-%m-%d')}), "
+            f"counting items by {date_basis}."
         )
         styled_summary = timeframe_summary_df.style.format(
             {
@@ -2444,11 +2509,11 @@ def main() -> None:
         )
 
         display_tx_df = df.copy()
-        display_tx_df["Order Date"] = display_tx_df["Order Date"].dt.strftime("%Y-%m-%d")
-        if "Cancelled Date" in display_tx_df.columns:
-            display_tx_df["Cancelled Date"] = display_tx_df["Cancelled Date"].apply(
-                lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and x is not None else ""
-            )
+        for date_col in ("Order Date", "Shipped Date", "Cancelled Date", BASIS_COL):
+            if date_col in display_tx_df.columns:
+                display_tx_df[date_col] = display_tx_df[date_col].apply(
+                    lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and x is not None else ""
+                )
 
         st.dataframe(
             display_tx_df.style.format({"Estimated Tax Value": "${:,.2f}"}),
