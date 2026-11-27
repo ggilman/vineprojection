@@ -14,6 +14,8 @@ While Amazon provides downloadable **Vine Itemized Reports (`.xlsx`)** for tax p
 
 ---
 
+> **New: browser extension for Chrome & Edge.** The [`extension/`](extension/README.md) folder has the same rolling-window view as a browser extension: no Python or installer, it uses your browser's own Amazon sign-in, and there's nothing to quit. It reads the Vine Orders page only.
+
 ## Quick Install & Launch (No Git Required)
 
 You do **not** need `git` or prior Python setup. Choose the method below for your operating system.
