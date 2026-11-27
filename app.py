@@ -5,7 +5,7 @@ Vine ETV Analyzer
 -----------------
 A lightweight Streamlit GUI application that dynamically parses Amazon Vine
 Itemized Reports (.xlsx), tracks your floating window of Estimated Tax Value
-(ETV) against a rolling cap (e.g., $6,000 over 30 days), and projects when
+(ETV) against a rolling cap (e.g., $6,500 over 30 days, with a warning at $6,000), and projects when
 older orders roll off so you can acquire items again.
 
 Run instructions:
@@ -92,6 +92,11 @@ OPTIONAL_COLUMNS: dict[str, list[str]] = {
 
 # Which date places a row in the rolling window. "Ship" uses Shipped Date, falling
 # back to Cancelled Date for cancellations (they never ship) and then Order Date.
+# Amazon warns once the rolling total reaches the warning level and blocks new
+# requests at the block limit.
+DEFAULT_WARNING_LEVEL = 6000.00
+DEFAULT_BLOCK_LIMIT = 6500.00
+
 DATE_BASIS_SHIP = "Ship Date"
 DATE_BASIS_ORDER = "Order Date"
 DATE_BASIS_OPTIONS = [DATE_BASIS_SHIP, DATE_BASIS_ORDER]
@@ -633,8 +638,11 @@ def build_decay_chart(
     threshold: float,
     crossing_info: dict[str, Any] | None,
     window_days: int,
+    warning_level: float | None = None,
+    warning_crossing: dict[str, Any] | None = None,
 ) -> go.Figure:
-    """Create an interactive Plotly line chart of the projected decay curve."""
+    """Create an interactive Plotly line chart of the projected decay curve, with
+    the block limit and (optionally) the lower warning level as horizontal lines."""
     fig = go.Figure()
 
     # Main Projected Decay Curve (solid line)
@@ -666,20 +674,53 @@ def build_decay_chart(
             x=[proj_df["Date"].min(), proj_df["Date"].max()],
             y=[threshold, threshold],
             mode="lines",
-            name=f"Threshold (${threshold:,.2f})",
+            name=f"Block Limit (${threshold:,.2f})",
             line={"color": "#DC2626", "width": 2.5, "dash": "dash"},
-            hovertemplate=f"Threshold Target: <b>${threshold:,.2f}</b><extra></extra>",
+            hovertemplate=f"Block Limit: <b>${threshold:,.2f}</b><extra></extra>",
         )
     )
+
+    if warning_level is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[proj_df["Date"].min(), proj_df["Date"].max()],
+                y=[warning_level, warning_level],
+                mode="lines",
+                name=f"Warning (${warning_level:,.2f})",
+                line={"color": "#D97706", "width": 2, "dash": "dot"},
+                hovertemplate=f"Warning Level: <b>${warning_level:,.2f}</b><extra></extra>",
+            )
+        )
+        if warning_crossing is not None and not warning_crossing["already_below"]:
+            fig.add_trace(
+                go.Scatter(
+                    x=[warning_crossing["date"]],
+                    y=[warning_crossing["projected_total"]],
+                    mode="markers",
+                    name="Drops Below Warning",
+                    marker={
+                        "size": 12,
+                        "color": "#D97706",
+                        "symbol": "diamond",
+                        "line": {"color": "#FFFFFF", "width": 2},
+                    },
+                    hovertemplate=(
+                        "<b>Drops Below Warning</b><br>"
+                        "Date: <b>%{x|%B %d, %Y}</b><br>"
+                        "Projected Total: <b>$%{y:,.2f}</b>"
+                        "<extra></extra>"
+                    ),
+                )
+            )
 
     # Highlight Crossing Date if detected within the projection horizon
     if crossing_info is not None:
         c_date = crossing_info["date"]
         c_val = crossing_info["projected_total"]
         label_prefix = (
-            "Already Under Threshold"
+            "Already Under Block Limit"
             if crossing_info["already_below"]
-            else "Threshold Crossing"
+            else "Drops Below Block Limit"
         )
 
         fig.add_trace(
@@ -1913,7 +1954,7 @@ def main() -> None:
     st.title("📉 Vine ETV Analyzer")
     st.caption(
         "See your floating window of Amazon Vine items and project when older orders roll off "
-        "below the rolling cap (e.g., $6,000 over 30 days) so you can acquire items again."
+        "below the rolling cap (e.g., $6,500 over 30 days, with a warning at $6,000) so you can acquire items again."
     )
 
     if session_ready() and not st.session_state.get("vine_live_attempted"):
@@ -2095,13 +2136,29 @@ def main() -> None:
         )
 
         tax_threshold = st.number_input(
-            "Tax Threshold ($)",
+            "Block Limit ($)",
             min_value=0.0,
             max_value=1_000_000.0,
-            value=6000.00,
+            value=DEFAULT_BLOCK_LIMIT,
             step=100.0,
             format="%.2f",
-            help="Target dollar threshold to monitor (default: $6,000.00).",
+            help=(
+                "Rolling total at which Amazon blocks new Vine requests "
+                f"(default: ${DEFAULT_BLOCK_LIMIT:,.2f})."
+            ),
+        )
+
+        warning_level = st.number_input(
+            "Warning Level ($)",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=DEFAULT_WARNING_LEVEL,
+            step=100.0,
+            format="%.2f",
+            help=(
+                "Rolling total at which Amazon starts warning you, before the block "
+                f"(default: ${DEFAULT_WARNING_LEVEL:,.2f}). Set it to 0 to hide it."
+            ),
         )
 
         sync_horizon = st.checkbox(
@@ -2281,6 +2338,18 @@ def main() -> None:
     )
 
     current_window_total = float(proj_df.iloc[0]["Projected Total"])
+    # A warning level at or above the block limit adds nothing, so it is hidden.
+    show_warning = 0 < float(warning_level) < float(tax_threshold)
+    warning_crossing = None
+    if show_warning:
+        _warn_df, warning_crossing = generate_decay_projection(
+            df=df,
+            base_date=base_date,
+            window_days=int(window_length),
+            threshold=float(warning_level),
+            horizon_days=int(projection_horizon),
+            inclusive_start=False,
+        )
     total_annual_tax_value = round(float(year_df["Estimated Tax Value"].sum()), 2)
     timeframe_summary_df = compute_timeframe_summary(
         df=df,
@@ -2348,9 +2417,13 @@ def main() -> None:
 
     with kpi2:
         st.metric(
-            label="Threshold Target",
+            label="Block Limit",
             value=f"${float(tax_threshold):,.2f}",
-            delta=f"Base Date: {base_date.strftime('%b %d, %Y')}",
+            delta=(
+                f"Warning at ${float(warning_level):,.2f}"
+                if show_warning
+                else f"Base Date: {base_date.strftime('%b %d, %Y')}"
+            ),
             delta_color="off",
         )
 
@@ -2379,23 +2452,37 @@ def main() -> None:
             )
 
     # Contextual Status Banner
+    in_warning_zone = show_warning and float(warning_level) <= current_window_total < float(tax_threshold)
     if crossing_info is not None:
-        if crossing_info["already_below"]:
+        if crossing_info["already_below"] and in_warning_zone:
+            warn_when = (
+                f"drops below the warning level on **{warning_crossing['date'].strftime('%B %d, %Y')}** "
+                f"(in **{warning_crossing['day_offset']} days**)"
+                if warning_crossing is not None
+                else f"stays at or above the warning level for the {projection_horizon}-day projection"
+            )
+            st.warning(
+                f"⚠️ **In the Warning Zone:** Your {int(window_length)}-day rolling total as of "
+                f"**{base_date.strftime('%B %d, %Y')}** is **${current_window_total:,.2f}**: at or above the "
+                f"**${float(warning_level):,.2f}** warning level, **${abs(variance_now):,.2f}** below the "
+                f"**${tax_threshold:,.2f}** block limit. Assuming no new orders, it {warn_when}."
+            )
+        elif crossing_info["already_below"]:
             st.success(
-                f"✅ **Currently Under Threshold:** Your {int(window_length)}-day rolling total "
+                f"✅ **Currently Under the Limit:** Your {int(window_length)}-day rolling total "
                 f"as of **{base_date.strftime('%B %d, %Y')}** is **${current_window_total:,.2f}**, "
-                f"which is already **${abs(variance_now):,.2f}** below the **${tax_threshold:,.2f}** threshold."
+                f"which is already **${abs(variance_now):,.2f}** below the **${tax_threshold:,.2f}** block limit."
             )
         else:
             st.warning(
-                f"⏳ **Threshold Crossing Detected:** Assuming no new orders, your {int(window_length)}-day "
+                f"⏳ **Block Limit Crossing Detected:** Assuming no new orders, your {int(window_length)}-day "
                 f"rolling total will drop below **${tax_threshold:,.2f}** on "
                 f"**{crossing_info['date'].strftime('%B %d, %Y')}** (in **{crossing_info['day_offset']} days**) "
                 f"at **${crossing_info['projected_total']:,.2f}**."
             )
     else:
         st.info(
-            f"ℹ️ **Above Threshold Across Horizon:** The projected {int(window_length)}-day rolling total "
+            f"ℹ️ **Above the Block Limit Across Horizon:** The projected {int(window_length)}-day rolling total "
             f"does not drop below **${tax_threshold:,.2f}** within the **{projection_horizon}-day** projection window."
         )
 
@@ -2430,6 +2517,8 @@ def main() -> None:
         threshold=float(tax_threshold),
         crossing_info=crossing_info,
         window_days=int(window_length),
+        warning_level=float(warning_level) if show_warning else None,
+        warning_crossing=warning_crossing,
     )
     st.plotly_chart(chart_fig, width="stretch")
 

@@ -97,7 +97,8 @@ Once the application opens in your browser (`http://localhost:8501`):
 2. **Configure Projection Parameters (Left Sidebar -> `2. Projection Parameters`):**
    - **Rolling Window Length (Days):** Number of trailing days in the rolling window (default: `30` days).
    - **Count Items By:** `Ship Date` *(default)* places each item in the window by its Shipped Date (cancellations, which never ship, use their Cancelled Date); `Order Date` uses the date you ordered it.
-   - **Tax Threshold ($):** Target dollar threshold to monitor (default: `$6,000.00`).
+   - **Block Limit ($):** Rolling total at which Amazon blocks new Vine requests (default: `$6,500.00`).
+   - **Warning Level ($):** Lower rolling total at which Amazon starts warning you (default: `$6,000.00`), drawn as a second line on the chart. Set it to `0` to hide it.
    - **Projection Horizon (Days):** Number of future days to project (defaults to matching your window length, or uncheck **Match Projection Horizon to Window Length** to enter a custom horizon).
 
 3. **Choose Base Date (Left Sidebar -> `3. Base Date Settings`):**
