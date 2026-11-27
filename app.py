@@ -545,12 +545,15 @@ def compute_timeframe_summary(
     base_date: pd.Timestamp,
     inclusive_start: bool = False,
     year_df: pd.DataFrame | None = None,
+    max_days: int | None = None,
 ) -> pd.DataFrame:
     """
     Build the Timeframe Summary Table for standard rolling periods:
     7 Days, 30 Days, 60 Days, 90 Days, and Full Year Total.
     `year_df` (default: `df`) holds the rows the Full Year Total covers, so a
     prior year's report loaded for the rolling window doesn't count toward it.
+    With `max_days` (data covering only that many days back), longer periods and
+    the Full Year row are left out rather than shown as partial totals.
     """
     base_ts = pd.Timestamp(base_date).normalize()
     periods = [
@@ -559,6 +562,8 @@ def compute_timeframe_summary(
         ("60 Days", 60),
         ("90 Days", 90),
     ]
+    if max_days is not None:
+        periods = [p for p in periods if p[1] <= max_days]
 
     summary_rows: list[dict[str, Any]] = []
     for label, days in periods:
@@ -589,6 +594,9 @@ def compute_timeframe_summary(
                 ),
             }
         )
+
+    if max_days is not None:
+        return pd.DataFrame(summary_rows)
 
     # Full Year / Cumulative Total across all valid rows in the report
     df = df if year_df is None else year_df
@@ -745,6 +753,13 @@ def build_decay_chart(
 
 VINE_ITEMS_URL = "https://www.amazon.com/vine/vine-items"
 VINE_ACCOUNT_URL = "https://www.amazon.com/vine/account"
+VINE_ORDERS_URL = "https://www.amazon.com/vine/orders"
+VINE_ORDERS_FILENAME = "vine_orders.json"
+# The rolling window the orders pages are read back over, a page-count safety
+# cap (10 orders per page), and the pause between page reads.
+ORDERS_LOOKBACK_DAYS = 30
+ORDERS_MAX_PAGES = 80
+ORDERS_PAGE_DELAY_MS = 700
 VINE_REPORTS_DIRNAME = "vine_reports"
 VINE_CONNECTION_FILENAME = ".vine_connection.json"
 
@@ -1083,186 +1098,165 @@ def classify_vine_page(html: str, url: str, visible_text: str | None = None) -> 
     return CAP_UNKNOWN, url
 
 
-def _unique_report_path(filename: str) -> Path:
-    reports = _reports_dir()
-    reports.mkdir(parents=True, exist_ok=True)
-    safe_name = Path(filename).name or "vine_itemized_report.xlsx"
-    dest = reports / safe_name
-    if dest.exists():
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        dest = reports / f"{dest.stem}_{stamp}{dest.suffix}"
-    return dest
+def _orders_cache_path() -> Path:
+    return _reports_dir() / VINE_ORDERS_FILENAME
 
 
-def _report_year(path: Path) -> int | None:
-    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", path.stem)
-    return int(match.group(1)) if match else None
+# Runs inside the Vine orders page: fetch one page of /vine/orders with the
+# page's own session and read each row's order timestamp (epoch ms; the visible
+# date is filled in by script, so it is empty in fetched HTML) and Fair market value.
+_ORDERS_PAGE_JS = """
+async (pageNo) => {
+  const resp = await fetch('/vine/orders?page=' + pageNo, {credentials: 'include'});
+  const finalUrl = resp.url || '';
+  const html = await resp.text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const rows = [];
+  for (const tr of doc.querySelectorAll('table.vvp-orders-table tr.vvp-orders-table--row')) {
+    const tsCell = tr.querySelector('[data-order-timestamp]');
+    const cells = tr.querySelectorAll('td');
+    const link = tr.querySelector('a[href*="/dp/"]');
+    const asin = link ? ((link.getAttribute('href') || '').match(/\\/dp\\/([A-Z0-9]{10})/) || [])[1] || '' : '';
+    const name = tr.querySelector('.a-truncate-full');
+    rows.push({
+      ts: tsCell ? Number(tsCell.getAttribute('data-order-timestamp')) : null,
+      fmv: cells.length > 3 ? cells[3].textContent.trim() : '',
+      asin: asin,
+      name: name ? name.textContent.trim() : (cells.length > 1 ? cells[1].textContent.trim() : ''),
+    });
+  }
+  return {status: resp.status, url: finalUrl, rows: rows};
+}
+"""
 
 
-def pick_auto_reports(reports: list[Path]) -> tuple[Path, Path | None]:
-    """From reports sorted newest first, return the newest report and the newest
-    one for the year before it (or None). The rolling window can reach back
-    across New Year, and Amazon issues one itemized report per tax year."""
-    primary = reports[0]
-    year = _report_year(primary)
-    if year is None:
-        return primary, None
-    prior = next((r for r in reports if _report_year(r) == year - 1), None)
-    return primary, prior
-
-
-def list_auto_reports() -> list[Path]:
-    reports = _reports_dir()
-    if not reports.is_dir():
-        return []
-    files = [p for p in reports.glob("*.xlsx") if not p.name.startswith("~$")]
-    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
-
-
-def _find_report_dropdown_trigger(page: Any, year: int) -> Any | None:
-    from playwright.sync_api import Error as PlaywrightError
-
-    try:
-        matches = page.get_by_text(
-            re.compile(r"Download itemized report for\s*\d{4}", re.IGNORECASE)
-        ).all()
-    except PlaywrightError:
-        return None
-    if not matches:
-        return None
-    for candidate in matches:
-        try:
-            if str(year) in (candidate.inner_text() or ""):
-                return candidate
-        except PlaywrightError:
-            continue
-    return matches[0]
-
-
-def _find_xlsx_option(page: Any) -> Any | None:
-    from playwright.sync_api import Error as PlaywrightError
-
-    selectors: tuple[str, ...] = (
-        '[role="option"]:has-text("XLSX")',
-        '[role="menuitem"]:has-text("XLSX")',
-        'li:has-text("XLSX")',
-        'button:has-text("XLSX")',
-        'a:has-text("XLSX")',
-        'option:text-matches("XLSX", "i")',
-    )
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            if loc.count() > 0:
-                return loc.last
-        except PlaywrightError:
-            continue
-    try:
-        text_loc = page.get_by_text(re.compile(r"^\s*XLSX\s*$", re.IGNORECASE))
-        if text_loc.count() > 0:
-            return text_loc.last
-    except PlaywrightError:
-        pass
-    return None
-
-
-def _save_attachment_response(attachments: list[Any]) -> Path | None:
-    from playwright.sync_api import Error as PlaywrightError
-
-    for resp in attachments:
-        try:
-            body = resp.body()
-        except PlaywrightError:
-            continue
-        if not body:
-            continue
-        disposition = str((resp.headers or {}).get("content-disposition", ""))
-        name_match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", disposition)
-        filename = (
-            name_match.group(1) if name_match else f"vine_itemized_report_{date.today().year}.xlsx"
-        )
-        dest = _unique_report_path(filename)
-        dest.write_bytes(body)
-        return dest
-    return None
-
-
-def _trigger_xlsx_download(page: Any) -> bool:
-    from playwright.sync_api import Error as PlaywrightError
-
-    # Amazon's real page (from saved DOM): a native <select id="vvp-tax-report-file-type-select">
-    # whose change event drives the JS download, mirrored by an a-declarative popover whose
-    # options are <a href="javascript:void(0)" data-value='{"stringVal":"XLSX"}'> anchors.
-    try:
-        page.select_option("select#vvp-tax-report-file-type-select", "XLSX", timeout=6000)
-        return True
-    except PlaywrightError:
-        pass
-
-    try:
-        page.locator("#vvp-tax-reporting-section span.a-button-dropdown").first.click(timeout=6000)
-        page.wait_for_timeout(700)
-        page.locator('a.a-dropdown-link[data-value*="XLSX"]').first.click(timeout=6000)
-        return True
-    except PlaywrightError:
-        pass
-
-    trigger = _find_report_dropdown_trigger(page, date.today().year)
-    if trigger is None:
-        return False
-    try:
-        trigger.click(timeout=6000)
-        page.wait_for_timeout(700)
-        option = _find_xlsx_option(page)
-        if option is None:
-            return False
-        option.click(timeout=6000)
-        return True
-    except PlaywrightError:
-        return False
-
-
-def download_itemized_report(context: Any, page: Any) -> dict[str, Any]:
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-    year = date.today().year
-    page.goto(VINE_ACCOUNT_URL, wait_until="domcontentloaded", timeout=45000)
-    page.wait_for_timeout(2000)
+def fetch_vine_orders(page: Any, lookback_days: int = ORDERS_LOOKBACK_DAYS) -> dict[str, Any]:
+    """
+    Walk the Vine "Orders" pages (newest first) and collect every order placed in
+    the last `lookback_days` days with its Fair market value. Stops at the first
+    page whose oldest order is older than that. Saves the result to the orders
+    cache file and returns a summary of what was fetched.
+    """
+    cutoff = pd.Timestamp(date.today()) - pd.Timedelta(days=int(lookback_days))
+    page.goto(VINE_ORDERS_URL + "?page=1", wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(1500)
     status, _ = classify_live_page(page)
     if status == CAP_NEEDS_LOGIN:
-        raise ConnectionError("Amazon redirected the account page back to sign-in.")
+        raise ConnectionError("Amazon redirected the Vine orders page back to sign-in.")
+    if status == CAP_BLOCKED:
+        raise ConnectionError("Amazon showed a bot check on the Vine orders page.")
 
-    attachments: list[Any] = []
+    orders: list[dict[str, Any]] = []
+    pages_read = 0
+    reached_cutoff = False
+    for page_no in range(1, ORDERS_MAX_PAGES + 1):
+        if page_no > 1:
+            page.wait_for_timeout(ORDERS_PAGE_DELAY_MS)  # go easy on Amazon
+        data = page.evaluate(_ORDERS_PAGE_JS, page_no)
+        final_url = str(data.get("url") or "")
+        if any(marker in final_url for marker in LOGIN_WALL_URL_MARKERS) or "/ap/" in final_url:
+            raise ConnectionError("Amazon asked for sign-in while reading the Vine orders pages.")
+        rows = data.get("rows") or []
+        pages_read += 1
+        if not rows:
+            reached_cutoff = True  # past the last page
+            break
+        oldest: pd.Timestamp | None = None
+        for row in rows:
+            if not row.get("ts"):
+                continue
+            # Local calendar date of the order, as the page itself shows it.
+            order_dt = pd.Timestamp(datetime.fromtimestamp(float(row["ts"]) / 1000.0))
+            oldest = order_dt if oldest is None else min(oldest, order_dt)
+            if order_dt.normalize() <= cutoff:
+                continue
+            try:
+                fmv = _parse_currency(row.get("fmv"))
+            except ValueError:
+                continue
+            orders.append(
+                {
+                    "order_date": order_dt.isoformat(),
+                    "fmv": round(fmv, 2),
+                    "asin": str(row.get("asin") or ""),
+                    "name": str(row.get("name") or ""),
+                }
+            )
+        if oldest is not None and oldest.normalize() <= cutoff:
+            reached_cutoff = True
+            break
 
-    def _on_response(resp: Any) -> None:
-        headers = resp.headers or {}
-        disposition = str(headers.get("content-disposition", "")).lower()
-        ctype = str(headers.get("content-type", "")).lower()
-        if "attachment" in disposition or "spreadsheet" in ctype or "excel" in ctype:
-            attachments.append(resp)
-
-    page.on("response", _on_response)
-
-    dest: Path | None = None
-    try:
-        with page.expect_download(timeout=30000) as download_info:
-            if not _trigger_xlsx_download(page):
-                raise LookupError(
-                    "Could not trigger the XLSX report download on the Vine account page."
-                )
-        download = download_info.value
-        filename = download.suggested_filename or f"vine_itemized_report_{year}.xlsx"
-        dest = _unique_report_path(filename)
-        download.save_as(str(dest))
-    except PlaywrightTimeoutError:
-        dest = _save_attachment_response(attachments)
-        if dest is None:
-            raise
-    return {
-        "path": str(dest),
-        "filename": dest.name,
+    payload = {
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
+        "lookback_days": int(lookback_days),
+        "pages_read": pages_read,
+        "complete": reached_cutoff,
+        "orders": orders,
     }
+    cache = _orders_cache_path()
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    return {
+        "path": str(cache),
+        "fetched_at": payload["fetched_at"],
+        "count": len(orders),
+        "total_fmv": round(sum(o["fmv"] for o in orders), 2),
+        "pages_read": pages_read,
+        "complete": reached_cutoff,
+    }
+
+
+def load_vine_orders_cache() -> tuple[pd.DataFrame, dict[str, Any]] | None:
+    """
+    Read the orders saved by `fetch_vine_orders` into the same shape that
+    `load_vine_excel` returns (Fair market value goes in the value column).
+    Returns None when nothing has been fetched yet.
+    """
+    cache = _orders_cache_path()
+    if not cache.is_file():
+        return None
+    try:
+        payload = json.loads(cache.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    records = [
+        {
+            "Order Date": pd.Timestamp(o["order_date"]),
+            "Shipped Date": None,
+            "Estimated Tax Value": float(o["fmv"]),
+            "Order Type": "ORDER",
+            "Cancelled Date": None,
+            "ASIN": o.get("asin", ""),
+            "Product Name": o.get("name", ""),
+        }
+        for o in payload.get("orders", [])
+        if o.get("order_date") is not None and o.get("fmv") is not None
+    ]
+    columns = [
+        "Order Date", "Shipped Date", "Estimated Tax Value", "Order Type",
+        "Cancelled Date", "ASIN", "Product Name",
+    ]
+    df = (
+        pd.DataFrame(records, columns=columns)
+        .sort_values(by="Order Date", ascending=True)
+        .reset_index(drop=True)
+    )
+    meta = {
+        "sheet_name": "Vine Orders page",
+        "header_row_number": 0,
+        "detected_headers": ["Product", "Order date", "Fair market value"],
+        "valid_rows": len(df),
+        "skipped_footer_rows": 0,
+        "malformed_rows": 0,
+        "min_order_date": df["Order Date"].min() if len(df) else None,
+        "max_order_date": df["Order Date"].max() if len(df) else None,
+        "has_shipped_date": False,
+        "fetched_at": payload.get("fetched_at"),
+        "lookback_days": int(payload.get("lookback_days") or ORDERS_LOOKBACK_DAYS),
+        "complete": bool(payload.get("complete")),
+        "pages_read": int(payload.get("pages_read") or 0),
+    }
+    return df, meta
 
 
 def _cookies_db_path() -> Path:
@@ -1373,8 +1367,8 @@ def _new_live_result() -> dict[str, Any]:
     return {
         "connected": False,
         "cap_status": None,
-        "report": None,
-        "report_error": None,
+        "orders": None,
+        "orders_error": None,
         "error": None,
         "channel": None,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -1463,8 +1457,8 @@ def _record_vine_status(
     used_channel: str | None,
     save_report: bool,
 ) -> bool:
-    """Store a classified Vine page in `result`; on a real Vine page also fetch
-    the itemized report and persist the connection marker. Returns connected."""
+    """Store a classified Vine page in `result`; on a real Vine page also read the
+    recent orders (Fair market value) and persist the connection marker. Returns connected."""
     from playwright.sync_api import Error as PlaywrightError
 
     result["cap_status"] = status
@@ -1478,9 +1472,9 @@ def _record_vine_status(
     result["error"] = None
     if save_report:
         try:
-            result["report"] = download_itemized_report(context, page)
-        except (ConnectionError, LookupError, PlaywrightError, OSError) as exc:
-            result["report_error"] = str(exc)[:300]
+            result["orders"] = fetch_vine_orders(page)
+        except (ConnectionError, PlaywrightError, OSError, ValueError) as exc:
+            result["orders_error"] = str(exc)[:300]
     _save_connection_meta(used_channel or "", connection_meta().get("source", "manual-login"))
     return True
 
@@ -1689,7 +1683,7 @@ def _wait_for_sign_in(context: Any, say: Any) -> tuple[str, Any | None, str]:
 def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str, Any]:
     """
     Open a visible browser on the session profile, let the user sign in, then
-    check the Vine status and download the report in the SAME window. Reusing
+    check the Vine status and read the recent orders in the SAME window. Reusing
     the window avoids the old close-then-relaunch race on the profile lock.
     Returns a result dict shaped like run_live_check().
     """
@@ -1720,7 +1714,7 @@ def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str,
                 result["channel"] = used_channel
                 outcome, vine_page, last_url = _wait_for_sign_in(context, say)
                 if outcome == "ok":
-                    say("Signed in — checking claim status and downloading the latest report...")
+                    say("Signed in — checking claim status and reading your recent Vine orders...")
                     vine_page.wait_for_timeout(1500)
                     status, detail = classify_live_page(vine_page)
                     connected = _record_vine_status(
@@ -1951,19 +1945,20 @@ def main() -> None:
             if use_local:
                 selected_local_file = st.selectbox("Workspace .xlsx file", local_xlsx_files)
 
-        auto_reports = list_auto_reports()
-        selected_auto_report: str | None = None
-        prior_year_report: Path | None = None
-        if auto_reports:
-            use_auto = st.checkbox(
-                "Use latest auto-downloaded Vine report",
+        live_orders = load_vine_orders_cache()
+        use_live_orders = False
+        if live_orders is not None:
+            fetched_text = str(live_orders[1].get("fetched_at") or "")[:16].replace("T", " ")
+            use_live_orders = st.checkbox(
+                "Use Vine Orders page (Fair market value)",
                 value=(uploaded_file is None and selected_local_file is None),
                 disabled=(uploaded_file is not None or selected_local_file is not None),
-                help=f"Newest of {len(auto_reports)} auto-download(s): {auto_reports[0].name}",
+                help=(
+                    f"{live_orders[1]['valid_rows']:,} orders from the last "
+                    f"{live_orders[1]['lookback_days']} days, read from amazon.com/vine/orders "
+                    f"at {fetched_text}. Refresh in the Amazon Vine Live section re-reads them."
+                ),
             )
-            if use_auto:
-                primary_report, prior_year_report = pick_auto_reports(auto_reports)
-                selected_auto_report = str(primary_report)
 
         use_demo = st.checkbox(
             "Load built-in sample report",
@@ -1971,7 +1966,7 @@ def main() -> None:
             disabled=(
                 uploaded_file is not None
                 or selected_local_file is not None
-                or selected_auto_report is not None
+                or use_live_orders
             ),
             help="Preview the dashboard using realistic sample Amazon Vine report data.",
         )
@@ -1993,10 +1988,15 @@ def main() -> None:
                 st.markdown(f"**Connection: Active** · {cap_badge} · checked {checked_time}")
                 if live_state.get("error"):
                     st.caption(f"⚠️ {live_state['error']}")
-                if live_state.get("report_error"):
-                    st.caption(f"⚠️ Report download: {live_state['report_error']}")
-                if live_state.get("report"):
-                    st.caption(f"📥 Latest auto report: `{live_state['report']['filename']}`")
+                if live_state.get("orders_error"):
+                    st.caption(f"⚠️ Reading Vine orders: {live_state['orders_error']}")
+                orders_info = live_state.get("orders")
+                if orders_info:
+                    st.caption(
+                        f"📦 {orders_info['count']:,} orders in the last {ORDERS_LOOKBACK_DAYS} days · "
+                        f"${orders_info['total_fmv']:,.2f} fair market value "
+                        f"({orders_info['pages_read']} page(s) read)"
+                    )
             else:
                 st.markdown("**Connection: Active** — use Refresh to check status.")
             live_col1, live_col2 = st.columns(2)
@@ -2157,9 +2157,9 @@ def main() -> None:
     elif selected_local_file is not None:
         file_source = str(Path.cwd() / selected_local_file)
         source_label = selected_local_file
-    elif selected_auto_report is not None:
-        file_source = selected_auto_report
-        source_label = f"{Path(selected_auto_report).name} (auto-downloaded)"
+    elif use_live_orders:
+        file_source = "live-orders"
+        source_label = "amazon.com/vine/orders (Fair market value)"
     elif use_demo:
         file_source = io.BytesIO(build_demo_excel_bytes())
         source_label = "Sample_Vine_Tax_Report_2026.xlsx (Demo)"
@@ -2189,7 +2189,15 @@ def main() -> None:
     # Parse Workbook with Graceful Error Handling
     # -----------------------------------------------------------------------
     try:
-        if hasattr(file_source, "getvalue"):
+        if use_live_orders and live_orders is not None:
+            df, meta = live_orders
+            if df.empty:
+                st.info(
+                    f"No Vine orders were found in the last {meta['lookback_days']} days on "
+                    "amazon.com/vine/orders, so the rolling window is $0.00."
+                )
+                return
+        elif hasattr(file_source, "getvalue"):
             df, meta = _load_vine_excel_bytes(file_source.getvalue())
         elif isinstance(file_source, (str, Path)):
             df, meta = _load_vine_excel_bytes(Path(file_source).read_bytes())
@@ -2204,41 +2212,25 @@ def main() -> None:
 
     # The current year's rows, for the annual figures, before any prior year is added.
     year_df = df
-    report_year = meta["max_order_date"].year
-    window_start_year = (
-        pd.Timestamp(date.today()) - pd.Timedelta(days=int(window_length))
-    ).year
-    if (
-        selected_auto_report is not None
-        and prior_year_report is not None
-        and window_start_year < report_year
-    ):
-        try:
-            prior_df, prior_meta = _load_vine_excel_bytes(prior_year_report.read_bytes())
-        except (ValueError, OSError, RuntimeError, KeyError) as exc:
-            st.warning(
-                f"Could not read last year's report `{prior_year_report.name}` ({exc}); "
-                "the rolling window may miss orders from before New Year."
-            )
-        else:
-            df = (
-                pd.concat([prior_df, df], ignore_index=True)
-                .sort_values(by="Order Date", ascending=True)
-                .reset_index(drop=True)
-            )
-            meta = {
-                **meta,
-                "valid_rows": len(df),
-                "skipped_footer_rows": meta["skipped_footer_rows"] + prior_meta["skipped_footer_rows"],
-                "malformed_rows": meta["malformed_rows"] + prior_meta["malformed_rows"],
-                "min_order_date": df["Order Date"].min(),
-            }
-            source_label += f" + {prior_year_report.name}"
-
     # Place every row by the chosen date (Ship or Order) for all calculations.
     df = apply_date_basis(df, date_basis)
     year_df = apply_date_basis(year_df, date_basis)
-    if date_basis == DATE_BASIS_SHIP and not meta.get("has_shipped_date", False):
+    if use_live_orders:
+        if date_basis == DATE_BASIS_SHIP:
+            st.info(
+                "The Vine Orders page lists order dates only, so items are counted by Order Date."
+            )
+        if not meta.get("complete", True):
+            st.warning(
+                f"Stopped after {meta['pages_read']} Vine orders pages before reaching "
+                f"{meta['lookback_days']} days back; the window total may be low."
+            )
+        if int(window_length) > int(meta["lookback_days"]):
+            st.warning(
+                f"Only the last {meta['lookback_days']} days of orders were read, so a "
+                f"{int(window_length)}-day window will miss older orders."
+            )
+    elif date_basis == DATE_BASIS_SHIP and not meta.get("has_shipped_date", False):
         st.warning(
             "This report has no Shipped Date column, so items are counted by Order Date "
             "(cancellations by Cancelled Date)."
@@ -2295,6 +2287,7 @@ def main() -> None:
         base_date=base_date,
         inclusive_start=False,
         year_df=year_df,
+        max_days=int(meta["lookback_days"]) if use_live_orders else None,
     )
 
     # Format Threshold Crossing KPI display. The value is just the short date (or a
@@ -2370,12 +2363,20 @@ def main() -> None:
         )
 
     with kpi4:
-        st.metric(
-            label="Total Annual Tax Value",
-            value=f"${total_annual_tax_value:,.2f}",
-            delta=f"{len(year_df):,} net line items",
-            delta_color="off",
-        )
+        if use_live_orders:
+            st.metric(
+                label=f"Fair Market Value, Last {meta['lookback_days']} Days",
+                value=f"${total_annual_tax_value:,.2f}",
+                delta=f"{len(year_df):,} orders from the Vine Orders page",
+                delta_color="off",
+            )
+        else:
+            st.metric(
+                label="Total Annual Tax Value",
+                value=f"${total_annual_tax_value:,.2f}",
+                delta=f"{len(year_df):,} net line items",
+                delta_color="off",
+            )
 
     # Contextual Status Banner
     if crossing_info is not None:

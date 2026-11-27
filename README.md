@@ -116,19 +116,19 @@ Once the application opens in your browser (`http://localhost:8501`):
 **By default the app is fully manual and offline — nothing changes until you opt in.** Click **🔌 Connect to Amazon Vine** in the left sidebar to enable:
 
 - **Live cap status** — the app loads `amazon.com/vine/vine-items` and looks for Amazon's *"Vine limits claiming activity… Your claiming will resume soon."* message, so you know **right now** whether you're capped instead of inferring it from the spreadsheet.
-- **Automatic report downloads** — the app pulls your itemized report straight from `amazon.com/vine/account` (the *"Download itemized report for …"* dropdown → **XLSX**) into a `vine_reports/` folder beside the app. The newest download is automatically offered as a data source.
+- **Live order totals** — instead of downloading the itemized spreadsheet, the app reads your **Vine Orders** pages (`amazon.com/vine/orders?page=1`, `page=2`, …, newest first) and adds up the **Fair market value** of every order placed in the last 30 days (by **Order date**). It stops at the first page older than that, saves the result to `vine_reports/vine_orders.json`, and offers it as the default data source for the chart. Because the Orders page lists order dates only, these totals are counted by Order Date. (The spreadsheet-download version of the app is tagged `0.1`.)
 
 ### How Sign-In Works (passwords are never read or stored)
 
 1. **Silent session reuse (first try):** the app copies a tiny cookie snapshot (`Cookies` database only) from your **installed Chrome or Edge** profile into `%LOCALAPPDATA%\VineProjection\vine-session\` and lets the *real* Chrome/Edge open Amazon with it. Because your browser was already signed in, this usually works with **zero interaction** — but Chrome/Edge guard their cookie file against copying while running, so for this path **close the browser completely first** (the app detects the lock and tells you).
 2. **One-time sign-in fallback:** if Amazon doesn't recognize that session (or you have no Chrome/Edge), a browser window opens once — sign in there like normal. Everything afterward is automatic.
-3. **Later launches:** the app refreshes cap status and re-downloads the report on startup. Expect a normal Chrome window to flash briefly during these checks — Amazon rejects headless and off-screen browsers, so the window has to be genuinely visible. If the saved session has expired you'll just see a **🟠 Sign-in needed** status until you click **🔑 Sign in** — no prompts, no surprises. (The app keeps a private backup of the session cookies inside the same folder and self-restores it if Amazon silently expires the live copy.)
+3. **Later launches:** the app refreshes cap status and re-reads your recent Vine orders on startup. Expect a normal Chrome window to flash briefly during these checks — Amazon rejects headless and off-screen browsers, so the window has to be genuinely visible. If the saved session has expired you'll just see a **🟠 Sign-in needed** status until you click **🔑 Sign in** — no prompts, no surprises. (The app keeps a private backup of the session cookies inside the same folder and self-restores it if Amazon silently expires the live copy.)
 
 **Control:** **🔄 Refresh** re-checks on demand, **⛔ Disconnect** deletes the saved session entirely.
 
 **Privacy & storage:** See **[PRIVACY.md](PRIVACY.md)** for the full privacy notice. In short:
 - Session snapshot (equivalent to an Amazon login cookie): `%LOCALAPPDATA%\VineProjection\vine-session\` — delete it or click **Disconnect** to revoke. Nothing is uploaded anywhere.
-- Downloaded reports and troubleshooting snapshots: `vine_reports/` (git-ignored).
+- Saved Vine orders (`vine_orders.json`) and troubleshooting snapshots: `vine_reports/` (git-ignored).
 - The **Troubleshooting → Save page snapshot** button dumps page HTML/screenshots to `vine_reports/debug/` to help tune selectors if Amazon's page layout changes.
 
 > **Note:** the live feature requires the `playwright` package (installed by the launcher, with a one-time Chromium download prompt). Automated page access can occasionally be challenged by Amazon's bot defenses — the **🔑 Sign in** button exists for that. Use this optional feature at your own discretion with respect to Amazon's Terms of Service.

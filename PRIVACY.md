@@ -72,7 +72,7 @@ A valid Amazon session cookie is **equivalent to a signed-in session** for that 
 
 ### 2.4 What is downloaded to your machine
 
-- **Itemized reports** → `vine_reports/` in the app folder (same financial sensitivity as §1.1; the folder is git-ignored so it is not accidentally published, but it is not encrypted).
+- **Recent Vine orders** → `vine_reports/vine_orders.json` in the app folder: order dates, Fair market values, ASINs and product names read from your Vine Orders pages for the last 30 days (same financial sensitivity as §1.1; the folder is git-ignored so it is not accidentally published, but it is not encrypted).
 - **Debug snapshots** (only if you press "Save page snapshot") → `vine_reports/debug/` — page **HTML and screenshots** that can include Amazon-internal identifiers such as your obfuscated customer ID and CSRF tokens. Treat these as sensitive: redact before sharing them in any bug report, and delete when done.
 
 ### 2.5 Network traffic while connected
@@ -84,7 +84,7 @@ All live traffic goes **only between your own machine and `amazon.com`**, using 
 | What | Location | Delete with |
 | :--- | :--- | :--- |
 | Session cookie snapshot (+ browser profile cache from the live sessions) | `%LOCALAPPDATA%\VineProjection\vine-session\` | **⛔ Disconnect** or delete the folder |
-| Downloaded itemized reports | `vine_reports\*.xlsx` | delete files |
+| Saved Vine orders | `vine_reportsine_orders.json` | delete file |
 | Debug HTML/screenshots | `vine_reports\debug\` | delete files |
 | Browser profile copy lock artifacts | same as session folder | same |
 | Amazon-side sessions | Amazon's servers | Amazon: sign out everywhere / change password |
