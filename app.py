@@ -807,6 +807,9 @@ ROUTE_ORDERS = "Vine Orders page"
 ROUTE_REPORT = "Itemized report file"
 ROUTE_OPTIONS = [ROUTE_ORDERS, ROUTE_REPORT]
 VINE_SETTINGS_FILENAME = "settings.json"
+# The last live check's result (claim status, what was fetched), shown on the
+# next launch so the app opens without contacting Amazon.
+VINE_LAST_LIVE_FILENAME = "last_live_check.json"
 VINE_REPORTS_DIRNAME = "vine_reports"
 VINE_CONNECTION_FILENAME = ".vine_connection.json"
 
@@ -898,6 +901,10 @@ def disconnect_session() -> None:
     root = _session_root()
     if root.exists():
         shutil.rmtree(root, ignore_errors=True)
+    try:
+        _last_live_path().unlink()
+    except OSError:
+        pass
 
 
 def _browser_user_data_roots() -> list[dict[str, str]]:
@@ -1351,6 +1358,42 @@ def save_data_route(route: str) -> None:
     settings["data_route"] = route
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(settings, indent=1), encoding="utf-8")
+
+
+def _last_live_path() -> Path:
+    return _reports_dir() / VINE_LAST_LIVE_FILENAME
+
+
+def save_last_live_result(result: dict[str, Any]) -> None:
+    """Remember a live check's result for the next launch. Results that never
+    reached Amazon (browser busy, Playwright missing) are not saved."""
+    if result.get("cap_status") is None:
+        return
+    path = _last_live_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, indent=1, default=str), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def load_last_live_result() -> dict[str, Any] | None:
+    try:
+        result = json.loads(_last_live_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def format_checked_at(iso_text: str) -> str:
+    """'today 14:05' or 'Nov 25, 14:05' for a saved check time."""
+    try:
+        when = datetime.fromisoformat(str(iso_text))
+    except ValueError:
+        return str(iso_text)
+    if when.date() == date.today():
+        return f"today {when:%H:%M}"
+    return f"{when:%b} {when.day}, {when:%H:%M}"
 
 
 def _orders_cache_path() -> Path:
@@ -1819,9 +1862,11 @@ def run_live_check(save_report: bool = True) -> dict[str, Any]:
         result["error"] = BROWSER_BUSY_MESSAGE
         return result
     try:
-        return _run_live_check_locked(save_report)
+        result = _run_live_check_locked(save_report)
     finally:
         lock.release()
+    save_last_live_result(result)
+    return result
 
 
 def _auth_cookie_value(context: Any) -> str | None:
@@ -2012,6 +2057,7 @@ def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str,
             result = _run_live_check_locked(save_report, bootstrap=False)
             if not result.get("connected"):
                 result["error"] = "The sign-in window was closed before sign-in finished."
+        save_last_live_result(result)
         return result
     finally:
         lock.release()
@@ -2182,6 +2228,15 @@ def main() -> None:
 
     if session_ready() and not st.session_state.get("vine_live_attempted"):
         st.session_state["vine_live_attempted"] = True
+        saved_live = load_last_live_result()
+        if saved_live is not None:
+            # Open on the saved data and status; Refresh contacts Amazon.
+            saved_live["from_cache"] = True
+            st.session_state["vine_live"] = saved_live
+    if session_ready() and "vine_live" not in st.session_state and not st.session_state.get(
+        "vine_live_first_check"
+    ):
+        st.session_state["vine_live_first_check"] = True
         with st.spinner(
             "Checking your saved Amazon Vine session (a Chrome window flashes briefly — "
             "Amazon blocks headless browsers)..."
@@ -2278,8 +2333,10 @@ def main() -> None:
                     CAP_BLOCKED: "🟠 Blocked",
                     CAP_UNKNOWN: "⚪ Unknown",
                 }.get(cap_status, "⚪ Unknown")
-                checked_time = str(live_state.get("checked_at", ""))[11:16]
+                checked_time = format_checked_at(str(live_state.get("checked_at", "")))
                 st.markdown(f"**Connection: Active** · {cap_badge} · checked {checked_time}")
+                if live_state.get("from_cache"):
+                    st.caption("Saved from the last check. Press 🔄 Refresh for current data from Amazon.")
                 if live_state.get("error"):
                     st.caption(f"⚠️ {live_state['error']}")
                 if live_state.get("orders_error"):
@@ -2780,6 +2837,11 @@ def main() -> None:
     live_result = st.session_state.get("vine_live")
     if live_result:
         live_cap_status = str(live_result.get("cap_status"))
+        as_of = (
+            f" _(as of {format_checked_at(str(live_result.get('checked_at', '')))})_"
+            if live_result.get("from_cache")
+            else ""
+        )
         if live_cap_status == CAP_CAPPED:
             mismatch_note = ""
             if current_window_total < float(tax_threshold):
@@ -2789,10 +2851,10 @@ def main() -> None:
                 )
             st.error(
                 "🚫 **Claiming is paused.** Amazon has paused your Vine claiming because "
-                f"your ETV cap was reached.{mismatch_note}"
+                f"your ETV cap was reached.{mismatch_note}{as_of}"
             )
         elif live_cap_status == CAP_OPEN:
-            st.success("✅ **Claiming is online**")
+            st.success(f"✅ **Claiming is online**{as_of}")
         elif live_cap_status in (CAP_NEEDS_LOGIN, CAP_BLOCKED):
             st.warning(
                 f"🟠 **Live Amazon check unavailable:** {live_result.get('error') or 'Sign-in required.'} "
