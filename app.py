@@ -801,6 +801,12 @@ VINE_ORDERS_FILENAME = "vine_orders.json"
 ORDERS_LOOKBACK_DAYS = 30
 ORDERS_MAX_PAGES = 80
 ORDERS_PAGE_DELAY_MS = 700
+# Which way the live check gets the numbers: read the Vine Orders pages (Fair
+# market value by order date) or download the itemized .xlsx report.
+ROUTE_ORDERS = "Vine Orders page"
+ROUTE_REPORT = "Itemized report file"
+ROUTE_OPTIONS = [ROUTE_ORDERS, ROUTE_REPORT]
+VINE_SETTINGS_FILENAME = "settings.json"
 VINE_REPORTS_DIRNAME = "vine_reports"
 VINE_CONNECTION_FILENAME = ".vine_connection.json"
 
@@ -1139,6 +1145,214 @@ def classify_vine_page(html: str, url: str, visible_text: str | None = None) -> 
     return CAP_UNKNOWN, url
 
 
+def _unique_report_path(filename: str) -> Path:
+    reports = _reports_dir()
+    reports.mkdir(parents=True, exist_ok=True)
+    safe_name = Path(filename).name or "vine_itemized_report.xlsx"
+    dest = reports / safe_name
+    if dest.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = reports / f"{dest.stem}_{stamp}{dest.suffix}"
+    return dest
+
+
+def _report_year(path: Path) -> int | None:
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", path.stem)
+    return int(match.group(1)) if match else None
+
+
+def pick_auto_reports(reports: list[Path]) -> tuple[Path, Path | None]:
+    """From reports sorted newest first, return the newest report and the newest
+    one for the year before it (or None). The rolling window can reach back
+    across New Year, and Amazon issues one itemized report per tax year."""
+    primary = reports[0]
+    year = _report_year(primary)
+    if year is None:
+        return primary, None
+    prior = next((r for r in reports if _report_year(r) == year - 1), None)
+    return primary, prior
+
+
+def list_auto_reports() -> list[Path]:
+    reports = _reports_dir()
+    if not reports.is_dir():
+        return []
+    files = [p for p in reports.glob("*.xlsx") if not p.name.startswith("~$")]
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _find_report_dropdown_trigger(page: Any, year: int) -> Any | None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    try:
+        matches = page.get_by_text(
+            re.compile(r"Download itemized report for\s*\d{4}", re.IGNORECASE)
+        ).all()
+    except PlaywrightError:
+        return None
+    if not matches:
+        return None
+    for candidate in matches:
+        try:
+            if str(year) in (candidate.inner_text() or ""):
+                return candidate
+        except PlaywrightError:
+            continue
+    return matches[0]
+
+
+def _find_xlsx_option(page: Any) -> Any | None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    selectors: tuple[str, ...] = (
+        '[role="option"]:has-text("XLSX")',
+        '[role="menuitem"]:has-text("XLSX")',
+        'li:has-text("XLSX")',
+        'button:has-text("XLSX")',
+        'a:has-text("XLSX")',
+        'option:text-matches("XLSX", "i")',
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                return loc.last
+        except PlaywrightError:
+            continue
+    try:
+        text_loc = page.get_by_text(re.compile(r"^\s*XLSX\s*$", re.IGNORECASE))
+        if text_loc.count() > 0:
+            return text_loc.last
+    except PlaywrightError:
+        pass
+    return None
+
+
+def _save_attachment_response(attachments: list[Any]) -> Path | None:
+    from playwright.sync_api import Error as PlaywrightError
+
+    for resp in attachments:
+        try:
+            body = resp.body()
+        except PlaywrightError:
+            continue
+        if not body:
+            continue
+        disposition = str((resp.headers or {}).get("content-disposition", ""))
+        name_match = re.search(r"filename\*?=(?:UTF-8'')?\"?([^\";]+)", disposition)
+        filename = (
+            name_match.group(1) if name_match else f"vine_itemized_report_{date.today().year}.xlsx"
+        )
+        dest = _unique_report_path(filename)
+        dest.write_bytes(body)
+        return dest
+    return None
+
+
+def _trigger_xlsx_download(page: Any) -> bool:
+    from playwright.sync_api import Error as PlaywrightError
+
+    # Amazon's real page (from saved DOM): a native <select id="vvp-tax-report-file-type-select">
+    # whose change event drives the JS download, mirrored by an a-declarative popover whose
+    # options are <a href="javascript:void(0)" data-value='{"stringVal":"XLSX"}'> anchors.
+    try:
+        page.select_option("select#vvp-tax-report-file-type-select", "XLSX", timeout=6000)
+        return True
+    except PlaywrightError:
+        pass
+
+    try:
+        page.locator("#vvp-tax-reporting-section span.a-button-dropdown").first.click(timeout=6000)
+        page.wait_for_timeout(700)
+        page.locator('a.a-dropdown-link[data-value*="XLSX"]').first.click(timeout=6000)
+        return True
+    except PlaywrightError:
+        pass
+
+    trigger = _find_report_dropdown_trigger(page, date.today().year)
+    if trigger is None:
+        return False
+    try:
+        trigger.click(timeout=6000)
+        page.wait_for_timeout(700)
+        option = _find_xlsx_option(page)
+        if option is None:
+            return False
+        option.click(timeout=6000)
+        return True
+    except PlaywrightError:
+        return False
+
+
+def download_itemized_report(context: Any, page: Any) -> dict[str, Any]:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    year = date.today().year
+    page.goto(VINE_ACCOUNT_URL, wait_until="domcontentloaded", timeout=45000)
+    page.wait_for_timeout(2000)
+    status, _ = classify_live_page(page)
+    if status == CAP_NEEDS_LOGIN:
+        raise ConnectionError("Amazon redirected the account page back to sign-in.")
+
+    attachments: list[Any] = []
+
+    def _on_response(resp: Any) -> None:
+        headers = resp.headers or {}
+        disposition = str(headers.get("content-disposition", "")).lower()
+        ctype = str(headers.get("content-type", "")).lower()
+        if "attachment" in disposition or "spreadsheet" in ctype or "excel" in ctype:
+            attachments.append(resp)
+
+    page.on("response", _on_response)
+
+    dest: Path | None = None
+    try:
+        with page.expect_download(timeout=30000) as download_info:
+            if not _trigger_xlsx_download(page):
+                raise LookupError(
+                    "Could not trigger the XLSX report download on the Vine account page."
+                )
+        download = download_info.value
+        filename = download.suggested_filename or f"vine_itemized_report_{year}.xlsx"
+        dest = _unique_report_path(filename)
+        download.save_as(str(dest))
+    except PlaywrightTimeoutError:
+        dest = _save_attachment_response(attachments)
+        if dest is None:
+            raise
+    return {
+        "path": str(dest),
+        "filename": dest.name,
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def _settings_path() -> Path:
+    return _reports_dir() / VINE_SETTINGS_FILENAME
+
+
+def load_data_route() -> str:
+    """The saved data route (Orders page by default)."""
+    try:
+        route = json.loads(_settings_path().read_text(encoding="utf-8")).get("data_route")
+    except (OSError, ValueError, AttributeError):
+        return ROUTE_ORDERS
+    return route if route in ROUTE_OPTIONS else ROUTE_ORDERS
+
+
+def save_data_route(route: str) -> None:
+    path = _settings_path()
+    try:
+        settings = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict):
+            settings = {}
+    except (OSError, ValueError):
+        settings = {}
+    settings["data_route"] = route
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=1), encoding="utf-8")
+
+
 def _orders_cache_path() -> Path:
     return _reports_dir() / VINE_ORDERS_FILENAME
 
@@ -1410,6 +1624,8 @@ def _new_live_result() -> dict[str, Any]:
         "cap_status": None,
         "orders": None,
         "orders_error": None,
+        "report": None,
+        "report_error": None,
         "error": None,
         "channel": None,
         "checked_at": datetime.now().isoformat(timespec="seconds"),
@@ -1498,8 +1714,9 @@ def _record_vine_status(
     used_channel: str | None,
     save_report: bool,
 ) -> bool:
-    """Store a classified Vine page in `result`; on a real Vine page also read the
-    recent orders (Fair market value) and persist the connection marker. Returns connected."""
+    """Store a classified Vine page in `result`; on a real Vine page also fetch the
+    data for the chosen route (recent orders' Fair market value, or the itemized
+    report) and persist the connection marker. Returns connected."""
     from playwright.sync_api import Error as PlaywrightError
 
     result["cap_status"] = status
@@ -1512,10 +1729,16 @@ def _record_vine_status(
     result["connected"] = True
     result["error"] = None
     if save_report:
-        try:
-            result["orders"] = fetch_vine_orders(page)
-        except (ConnectionError, PlaywrightError, OSError, ValueError) as exc:
-            result["orders_error"] = str(exc)[:300]
+        if load_data_route() == ROUTE_REPORT:
+            try:
+                result["report"] = download_itemized_report(context, page)
+            except (ConnectionError, LookupError, PlaywrightError, OSError) as exc:
+                result["report_error"] = str(exc)[:300]
+        else:
+            try:
+                result["orders"] = fetch_vine_orders(page)
+            except (ConnectionError, PlaywrightError, OSError, ValueError) as exc:
+                result["orders_error"] = str(exc)[:300]
     _save_connection_meta(used_channel or "", connection_meta().get("source", "manual-login"))
     return True
 
@@ -1724,7 +1947,7 @@ def _wait_for_sign_in(context: Any, say: Any) -> tuple[str, Any | None, str]:
 def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str, Any]:
     """
     Open a visible browser on the session profile, let the user sign in, then
-    check the Vine status and read the recent orders in the SAME window. Reusing
+    check the Vine status and fetch the chosen data in the SAME window. Reusing
     the window avoids the old close-then-relaunch race on the profile lock.
     Returns a result dict shaped like run_live_check().
     """
@@ -1755,7 +1978,7 @@ def perform_sign_in(progress: Any = None, save_report: bool = True) -> dict[str,
                 result["channel"] = used_channel
                 outcome, vine_page, last_url = _wait_for_sign_in(context, say)
                 if outcome == "ok":
-                    say("Signed in — checking claim status and reading your recent Vine orders...")
+                    say("Signed in — checking claim status and fetching your Vine data...")
                     vine_page.wait_for_timeout(1500)
                     status, detail = classify_live_page(vine_page)
                     connected = _record_vine_status(
@@ -1986,7 +2209,22 @@ def main() -> None:
             if use_local:
                 selected_local_file = st.selectbox("Workspace .xlsx file", local_xlsx_files)
 
-        live_orders = load_vine_orders_cache()
+        saved_route = load_data_route()
+        data_route = st.radio(
+            "Amazon data route",
+            options=ROUTE_OPTIONS,
+            index=ROUTE_OPTIONS.index(saved_route),
+            help=(
+                "How the live Amazon Vine check gets your numbers. Vine Orders page: adds up "
+                "Fair market value for orders placed in the last 30 days (by order date). "
+                "Itemized report file: downloads the .xlsx report from your Vine account page "
+                "(Estimated Tax Value, by ship or order date). Press Refresh after switching."
+            ),
+        )
+        if data_route != saved_route:
+            save_data_route(data_route)
+
+        live_orders = load_vine_orders_cache() if data_route == ROUTE_ORDERS else None
         use_live_orders = False
         if live_orders is not None:
             fetched_text = str(live_orders[1].get("fetched_at") or "")[:16].replace("T", " ")
@@ -2001,6 +2239,20 @@ def main() -> None:
                 ),
             )
 
+        auto_reports = list_auto_reports() if data_route == ROUTE_REPORT else []
+        selected_auto_report: str | None = None
+        prior_year_report: Path | None = None
+        if auto_reports:
+            use_auto = st.checkbox(
+                "Use latest auto-downloaded Vine report",
+                value=(uploaded_file is None and selected_local_file is None),
+                disabled=(uploaded_file is not None or selected_local_file is not None),
+                help=f"Newest of {len(auto_reports)} auto-download(s): {auto_reports[0].name}",
+            )
+            if use_auto:
+                primary_report, prior_year_report = pick_auto_reports(auto_reports)
+                selected_auto_report = str(primary_report)
+
         use_demo = st.checkbox(
             "Load built-in sample report",
             value=False,
@@ -2008,6 +2260,7 @@ def main() -> None:
                 uploaded_file is not None
                 or selected_local_file is not None
                 or use_live_orders
+                or selected_auto_report is not None
             ),
             help="Preview the dashboard using realistic sample Amazon Vine report data.",
         )
@@ -2031,6 +2284,10 @@ def main() -> None:
                     st.caption(f"⚠️ {live_state['error']}")
                 if live_state.get("orders_error"):
                     st.caption(f"⚠️ Reading Vine orders: {live_state['orders_error']}")
+                if live_state.get("report_error"):
+                    st.caption(f"⚠️ Report download: {live_state['report_error']}")
+                if live_state.get("report"):
+                    st.caption(f"📥 Latest auto report: `{live_state['report']['filename']}`")
                 orders_info = live_state.get("orders")
                 if orders_info:
                     st.caption(
@@ -2217,6 +2474,9 @@ def main() -> None:
     elif use_live_orders:
         file_source = "live-orders"
         source_label = "amazon.com/vine/orders (Fair market value)"
+    elif selected_auto_report is not None:
+        file_source = selected_auto_report
+        source_label = f"{Path(selected_auto_report).name} (auto-downloaded)"
     elif use_demo:
         file_source = io.BytesIO(build_demo_excel_bytes())
         source_label = "Sample_Vine_Tax_Report_2026.xlsx (Demo)"
@@ -2269,6 +2529,37 @@ def main() -> None:
 
     # The current year's rows, for the annual figures, before any prior year is added.
     year_df = df
+    report_year = meta["max_order_date"].year
+    window_start_year = (
+        pd.Timestamp(date.today()) - pd.Timedelta(days=int(window_length))
+    ).year
+    if (
+        selected_auto_report is not None
+        and prior_year_report is not None
+        and window_start_year < report_year
+    ):
+        try:
+            prior_df, prior_meta = _load_vine_excel_bytes(prior_year_report.read_bytes())
+        except (ValueError, OSError, RuntimeError, KeyError) as exc:
+            st.warning(
+                f"Could not read last year's report `{prior_year_report.name}` ({exc}); "
+                "the rolling window may miss orders from before New Year."
+            )
+        else:
+            df = (
+                pd.concat([prior_df, df], ignore_index=True)
+                .sort_values(by="Order Date", ascending=True)
+                .reset_index(drop=True)
+            )
+            meta = {
+                **meta,
+                "valid_rows": len(df),
+                "skipped_footer_rows": meta["skipped_footer_rows"] + prior_meta["skipped_footer_rows"],
+                "malformed_rows": meta["malformed_rows"] + prior_meta["malformed_rows"],
+                "min_order_date": df["Order Date"].min(),
+            }
+            source_label += f" + {prior_year_report.name}"
+
     # Place every row by the chosen date (Ship or Order) for all calculations.
     df = apply_date_basis(df, date_basis)
     year_df = apply_date_basis(year_df, date_basis)
